@@ -10,7 +10,6 @@ public final class TerminalManager: @unchecked Sendable {
 
     private init() {}
 
-    /// Enters raw terminal mode if STDIN is a TTY.
     public func enableRawMode() {
         lock.lock()
         defer { lock.unlock() }
@@ -20,14 +19,11 @@ public final class TerminalManager: @unchecked Sendable {
 
         var raw = originalTermios
         cfmakeraw(&raw)
-        // Keep output post-processing enabled OR let guest tty handle it:
-        // With cfmakeraw, guest serial console (hvc0) handles CR/LF and signal generation (Ctrl+C -> SIGINT inside guest)
         if tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 {
             isRawMode = true
         }
     }
 
-    /// Restores the host terminal to its original settings.
     public func restore() {
         lock.lock()
         defer { lock.unlock() }
@@ -38,12 +34,11 @@ public final class TerminalManager: @unchecked Sendable {
         isRawMode = false
     }
 
-    /// Queries the current host terminal size (columns, rows) so the guest shell can configure `stty cols X rows Y`.
     public static func currentWindowSize() -> (cols: Int, rows: Int) {
         var ws = winsize()
         if ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0, ws.ws_row > 0 {
             return (Int(ws.ws_col), Int(ws.ws_row))
         }
-        return (80, 24)
+        return (100, 30)
     }
 }

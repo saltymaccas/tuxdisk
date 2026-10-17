@@ -30,7 +30,6 @@ public enum KernelExtractor {
             throw KernelError.fileNotFound(sourceURL.path)
         }
 
-        // If output already exists and is newer than source, and has ARM\x64 magic, reuse it
         if fm.fileExists(atPath: outputURL.path),
            try isRawArm64Image(at: outputURL) {
             return outputURL
@@ -51,19 +50,13 @@ public enum KernelExtractor {
             throw KernelError.unsupportedKernelFormat(sourceURL.path)
         }
 
-        // Check standard gzip header (1f 8b 08) at offset 0
+        // Standard gzip header (1f 8b 08) at offset 0
         if data[0] == 0x1F && data[1] == 0x8B && data[2] == 0x08 {
             try gunzipData(data, to: outputURL)
             return outputURL
         }
 
-        // Check EFI zboot header ("MZ" at 0, "zboot" at 0x18)
-        // EFI zboot header layout (drivers/firmware/efi/libstub/zboot-header.S):
-        //   0x00: "MZ"
-        //   0x18: "zboot\0\0\0" (or "zboot")
-        //   0x20: uint32_t payload_offset
-        //   0x24: uint32_t payload_size
-        //   0x30: compression type string ("gzip", "zstd", "lzma", etc.)
+        // EFI zboot header ("MZ" at 0, "zboot" at 0x18)
         if data[0] == 0x4D && data[1] == 0x5A {
             let zbootMagic = String(data: data.subdata(in: 0x18..<0x1D), encoding: .ascii)
             if zbootMagic == "zboot" {
@@ -91,7 +84,6 @@ public enum KernelExtractor {
                 }
             }
 
-            // Fallback: scan for embedded gzip stream (1f 8b 08 00) inside PE wrapper
             let gzipPattern = Data([0x1F, 0x8B, 0x08, 0x00])
             if let range = data.range(of: gzipPattern) {
                 let payload = data.subdata(in: range.lowerBound..<data.count)
@@ -105,7 +97,6 @@ public enum KernelExtractor {
         throw KernelError.unsupportedKernelFormat(sourceURL.path)
     }
 
-    /// Checks for ARM64 Linux kernel Image magic (`ARM\x64` = 0x41 0x52 0x4D 0x64 at offset 0x38)
     public static func isRawArm64Image(at url: URL) throws -> Bool {
         let fh = try FileHandle(forReadingFrom: url)
         defer { try? fh.close() }
@@ -134,8 +125,6 @@ public enum KernelExtractor {
         try proc.run()
         proc.waitUntilExit()
 
-        // Note: gzip exits with code 2 (trailing garbage ignored) when decompressing
-        // an embedded gzip stream inside an EFI zboot image; that is normal and valid.
         if proc.terminationStatus != 0 && proc.terminationStatus != 2 {
             let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             throw KernelError.decompressionFailed("gzip exited with status \(proc.terminationStatus): \(errStr)")

@@ -14,6 +14,7 @@ public struct VMConfigurationOptions: Sendable {
     public var memorySizeMB: UInt64 = 2048
     public var kernelCommandLine: String
     public var rawTerminal: Bool = true
+    public var quietAttachmentLogs: Bool = false
 
     public init(
         kernelURL: URL,
@@ -27,7 +28,8 @@ public struct VMConfigurationOptions: Sendable {
         cpuCount: Int = 2,
         memorySizeMB: UInt64 = 2048,
         kernelCommandLine: String,
-        rawTerminal: Bool = true
+        rawTerminal: Bool = true,
+        quietAttachmentLogs: Bool = false
     ) {
         self.kernelURL = kernelURL
         self.initrdURL = initrdURL
@@ -41,6 +43,7 @@ public struct VMConfigurationOptions: Sendable {
         self.memorySizeMB = memorySizeMB
         self.kernelCommandLine = kernelCommandLine
         self.rawTerminal = rawTerminal
+        self.quietAttachmentLogs = quietAttachmentLogs
     }
 }
 
@@ -113,15 +116,18 @@ public enum VMRunner {
             storageDevices.append(rootDev)
         }
 
-        for diskPath in options.externalDisks {
+        for (index, diskPath) in options.externalDisks.enumerated() {
             let (blockDev, resolvedPath) = try DiskManager.createBlockDeviceConfiguration(
                 path: diskPath,
                 readOnly: options.externalDisksReadOnly,
                 allowInternal: options.allowInternalDisks,
                 unmountFirst: true
             )
-            let modeLabel = options.externalDisksReadOnly ? "read-only" : "read-write"
-            FileHandle.standardError.write(Data("==> Attached \(resolvedPath) (\(modeLabel))\n".utf8))
+            if !options.quietAttachmentLogs {
+                let guestLetter = String(UnicodeScalar(UInt8(ascii: "b") + UInt8(index)))
+                let modeLabel = options.externalDisksReadOnly ? "read-only" : "read-write"
+                ConsoleStyle.info("Attached \(resolvedPath) ──▶ /dev/vd\(guestLetter) (\(modeLabel))")
+            }
             storageDevices.append(blockDev)
         }
         config.storageDevices = storageDevices
@@ -139,9 +145,28 @@ public enum VMRunner {
 
         try config.validate()
 
+        do {
+            try await startVM(with: config, rawTerminal: options.rawTerminal)
+        } catch {
+            if !config.directorySharingDevices.isEmpty &&
+               error.localizedDescription.localizedCaseInsensitiveContains("Fuse sandbox extension") {
+                if !options.quietAttachmentLogs {
+                    ConsoleStyle.warn("VirtioFS host sharing unavailable in sandboxed environment; booting without /mnt/host share.")
+                }
+                config.directorySharingDevices = []
+                try config.validate()
+                try await startVM(with: config, rawTerminal: options.rawTerminal)
+            } else {
+                throw error
+            }
+        }
+    }
+
+    @MainActor
+    private static func startVM(with config: VZVirtualMachineConfiguration, rawTerminal: Bool) async throws {
         let vm = VZVirtualMachine(configuration: config)
 
-        if options.rawTerminal {
+        if rawTerminal {
             TerminalManager.shared.enableRawMode()
         }
         defer {
@@ -157,7 +182,6 @@ public enum VMRunner {
                     continuation.resume(returning: ())
                 }
             }
-            // Keep delegate alive on vm
             objc_setAssociatedObject(vm, "vm_delegate_key", delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
             vm.delegate = delegate
 

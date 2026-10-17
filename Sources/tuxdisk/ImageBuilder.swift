@@ -3,9 +3,11 @@ import Foundation
 public struct VMAssetPaths: Sendable {
     public let baseDir: URL
     public var rawKernelURL: URL { baseDir.appendingPathComponent("vmlinux.raw") }
+    public var baseInitrdURL: URL { baseDir.appendingPathComponent("initramfs-base.img") }
     public var bootInitrdURL: URL { baseDir.appendingPathComponent("initramfs-boot.img") }
     public var rootDiskURL: URL { baseDir.appendingPathComponent("rootfs.img") }
     public var readyMarkerURL: URL { baseDir.appendingPathComponent(".ready-v1") }
+    public var scriptsHashURL: URL { baseDir.appendingPathComponent(".scripts-hash") }
 
     public var isReady: Bool {
         let fm = FileManager.default
@@ -38,13 +40,12 @@ public enum ImageBuilder {
     public static let alpineVersion = "3.21.3"
     public static let alpineMirror = "https://dl-cdn.alpinelinux.org/alpine"
 
-    /// Resolves the assets directory, respecting `LINUX_DISK_VM_HOME`, project-local `.vm-assets`, and `SUDO_USER`.
+    /// Resolves the assets directory, respecting `TUXDISK_HOME`, `LINUX_DISK_VM_HOME`, project-local `.vm-assets`, and `SUDO_USER`.
     public static func defaultAssetsDirectory() -> URL {
         let env = ProcessInfo.processInfo.environment
-        if let customHome = env["LINUX_DISK_VM_HOME"], !customHome.isEmpty {
+        if let customHome = env["TUXDISK_HOME"] ?? env["LINUX_DISK_VM_HOME"], !customHome.isEmpty {
             return URL(fileURLWithPath: customHome)
         }
-        // Check if running from <repo>/bin/linux-disk-vm where <repo>/Package.swift exists
         if let execPath = CommandLine.arguments.first {
             let execURL = URL(fileURLWithPath: execPath).standardizedFileURL
             let repoCandidate = execURL.deletingLastPathComponent().deletingLastPathComponent()
@@ -55,37 +56,44 @@ public enum ImageBuilder {
         if let sudoUser = env["SUDO_USER"], !sudoUser.isEmpty, sudoUser != "root" {
             let sudoHome = URL(fileURLWithPath: "/Users/\(sudoUser)")
             if FileManager.default.fileExists(atPath: sudoHome.path) {
-                return sudoHome.appendingPathComponent(".local/share/linux-disk-vm")
+                return sudoHome.appendingPathComponent(".local/share/tuxdisk")
             }
         }
         return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/linux-disk-vm")
+            .appendingPathComponent(".local/share/tuxdisk")
     }
 
     @MainActor
     public static func ensurePrepared(assetsDir: URL = defaultAssetsDirectory(), force: Bool = false) async throws -> VMAssetPaths {
         let paths = VMAssetPaths(baseDir: assetsDir)
+        let fm = FileManager.default
+
         if paths.isReady && !force {
+            // Preserve base initrd if upgrading from earlier build
+            if !fm.fileExists(atPath: paths.baseInitrdURL.path) {
+                try? fm.copyItem(at: paths.bootInitrdURL, to: paths.baseInitrdURL)
+            }
+            try syncRuntimeOverlayIfNeeded(paths: paths)
             return paths
         }
 
-        let fm = FileManager.default
         try fm.createDirectory(at: assetsDir, withIntermediateDirectories: true)
 
         if force {
             try? fm.removeItem(at: paths.readyMarkerURL)
             try? fm.removeItem(at: paths.rootDiskURL)
             try? fm.removeItem(at: paths.rawKernelURL)
+            try? fm.removeItem(at: paths.baseInitrdURL)
             try? fm.removeItem(at: paths.bootInitrdURL)
+            try? fm.removeItem(at: paths.scriptsHashURL)
         }
 
-        print("==> Preparing lightweight Alpine Linux VM (aarch64) in \(assetsDir.path)...")
+        ConsoleStyle.info("Preparing tuxdisk Alpine Linux VM (aarch64) in \(assetsDir.path)...")
 
         let netbootKernelURL = assetsDir.appendingPathComponent("vmlinuz-virt.netboot")
         let netbootInitrdURL = assetsDir.appendingPathComponent("initramfs-virt.netboot")
         let minirootfsURL = assetsDir.appendingPathComponent("alpine-minirootfs.tar.gz")
 
-        // 1. Download Alpine netboot kernel, netboot initramfs, and minirootfs if not cached
         if !fm.fileExists(atPath: netbootKernelURL.path) {
             let url = "\(alpineMirror)/\(alpineBranch)/releases/aarch64/netboot/vmlinuz-virt"
             print("  -> Downloading Alpine Linux arm64 kernel (vmlinuz-virt)...")
@@ -104,32 +112,28 @@ public enum ImageBuilder {
             try downloadFile(from: url, to: minirootfsURL)
         }
 
-        // 2. Decompress kernel into raw ARM64 Image format for VZLinuxBootLoader
         let bootstrapKernelURL = assetsDir.appendingPathComponent("vmlinux-bootstrap.raw")
         print("  -> Extracting uncompressed ARM64 kernel Image...")
         _ = try KernelExtractor.ensureUncompressedKernel(at: netbootKernelURL, outputURL: bootstrapKernelURL)
 
-        // 3. Write guest scripts to staging folder shared via VirtioFS during bootstrap
         let scriptsDir = assetsDir.appendingPathComponent("guest-scripts")
         try fm.createDirectory(at: scriptsDir, withIntermediateDirectories: true)
-        try writeExecutableScript(GuestScripts.vmInitScript, to: scriptsDir.appendingPathComponent("vm-init"))
-        try writeExecutableScript(GuestScripts.disksCommandScript, to: scriptsDir.appendingPathComponent("disks"))
-        try writeExecutableScript(GuestScripts.mountDiskScript, to: scriptsDir.appendingPathComponent("mount-disk"))
-        try writeExecutableScript(GuestScripts.unmountAllScript, to: scriptsDir.appendingPathComponent("unmount-all"))
+        for item in GuestScripts.allFiles {
+            let name = URL(fileURLWithPath: item.guestPath).lastPathComponent
+            try writeExecutableScript(item.content, to: scriptsDir.appendingPathComponent(name))
+        }
 
-        // 4. Create 2 GB sparse rootfs.img file
         print("  -> Creating 2 GB sparse root disk image (rootfs.img)...")
         try createSparseDiskImage(at: paths.rootDiskURL, sizeBytes: 2 * 1024 * 1024 * 1024)
 
-        // 5. Build bootstrap initramfs by concatenating initramfs-virt.netboot + custom overlay /init
         let bootstrapInitrdURL = assetsDir.appendingPathComponent("initramfs-bootstrap.img")
         try buildCombinedInitramfs(
             baseInitrd: netbootInitrdURL,
             initScriptContent: bootstrapOverlayInitScript,
+            extraFiles: [],
             outputURL: bootstrapInitrdURL
         )
 
-        // 6. Boot the VM in automated setup mode to format rootfs.img and install packages
         let setupSuccessMarker = assetsDir.appendingPathComponent(".setup-done")
         try? fm.removeItem(at: setupSuccessMarker)
 
@@ -155,7 +159,6 @@ public enum ImageBuilder {
             throw ImageBuilderError.provisioningFailed("Bootstrap VM exited before completing setup. Check network connectivity.")
         }
 
-        // 7. Extract the installed kernel & initramfs from the provisioned rootfs so kernel & /lib/modules match 100%
         let installedKernelURL = assetsDir.appendingPathComponent("installed-vmlinuz-virt")
         let installedInitrdURL = assetsDir.appendingPathComponent("installed-initramfs-virt")
 
@@ -165,13 +168,11 @@ public enum ImageBuilder {
         try? fm.removeItem(at: paths.rawKernelURL)
         _ = try KernelExtractor.ensureUncompressedKernel(at: sourceKernelForBoot, outputURL: paths.rawKernelURL)
 
-        try buildCombinedInitramfs(
-            baseInitrd: sourceInitrdForBoot,
-            initScriptContent: runtimeOverlayInitScript,
-            outputURL: paths.bootInitrdURL
-        )
+        try? fm.removeItem(at: paths.baseInitrdURL)
+        try fm.copyItem(at: sourceInitrdForBoot, to: paths.baseInitrdURL)
 
-        // Clean up temporary bootstrap artifacts
+        try syncRuntimeOverlayIfNeeded(paths: paths, forceRebuild: true)
+
         try? fm.removeItem(at: bootstrapKernelURL)
         try? fm.removeItem(at: bootstrapInitrdURL)
         try? fm.removeItem(at: installedKernelURL)
@@ -179,16 +180,42 @@ public enum ImageBuilder {
         try? fm.removeItem(at: setupSuccessMarker)
 
         try Data("ready\n".utf8).write(to: paths.readyMarkerURL)
-        print("==> Setup complete! Lightweight Linux VM image is ready at \(assetsDir.path)")
+        ConsoleStyle.success("Setup complete! tuxdisk VM image is ready at \(assetsDir.path)")
         return paths
     }
 
-    private static func writeExecutableScript(_ content: String, to url: URL) throws {
-        try Data(content.utf8).write(to: url)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    /// Rebuilds `initramfs-boot.img` with the latest `GuestScripts` whenever scripts change
+    public static func syncRuntimeOverlayIfNeeded(paths: VMAssetPaths, forceRebuild: Bool = false) throws {
+        let fm = FileManager.default
+        let combinedContent = GuestScripts.allFiles.map { "\($0.guestPath):\($0.content)" }.joined(separator: "\n---\n") + runtimeOverlayInitScript
+        let currentHash = String(combinedContent.hashValue)
+
+        if !forceRebuild,
+           fm.fileExists(atPath: paths.bootInitrdURL.path),
+           let savedHash = try? String(contentsOf: paths.scriptsHashURL, encoding: .utf8),
+           savedHash == currentHash {
+            return
+        }
+
+        let baseInitrd = fm.fileExists(atPath: paths.baseInitrdURL.path) ? paths.baseInitrdURL : paths.bootInitrdURL
+        guard fm.fileExists(atPath: baseInitrd.path) else { return }
+
+        let tempOut = paths.baseDir.appendingPathComponent("initramfs-boot.img.tmp")
+        try buildCombinedInitramfs(
+            baseInitrd: baseInitrd,
+            initScriptContent: runtimeOverlayInitScript,
+            extraFiles: GuestScripts.allFiles,
+            outputURL: tempOut
+        )
+
+        if fm.fileExists(atPath: paths.bootInitrdURL.path) {
+            try fm.removeItem(at: paths.bootInitrdURL)
+        }
+        try fm.moveItem(at: tempOut, to: paths.bootInitrdURL)
+        try Data(currentHash.utf8).write(to: paths.scriptsHashURL)
     }
 
-    private static func createSparseDiskImage(at url: URL, sizeBytes: Int64) throws {
+    public static func createSparseDiskImage(at url: URL, sizeBytes: Int64) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) {
             try fm.removeItem(at: url)
@@ -197,6 +224,12 @@ public enum ImageBuilder {
         let fh = try FileHandle(forWritingTo: url)
         defer { try? fh.close() }
         try fh.truncate(atOffset: UInt64(sizeBytes))
+    }
+
+    private static func writeExecutableScript(_ content: String, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(content.utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
 
     private static func downloadFile(from urlString: String, to destinationURL: URL) throws {
@@ -221,21 +254,33 @@ public enum ImageBuilder {
         try FileManager.default.moveItem(at: tempURL, to: destinationURL)
     }
 
-    /// Concatenates `baseInitrd` (`cpio.gz`) with a newly generated `cpio.gz` containing `/init`
-    private static func buildCombinedInitramfs(baseInitrd: URL, initScriptContent: String, outputURL: URL) throws {
+    private static func buildCombinedInitramfs(
+        baseInitrd: URL,
+        initScriptContent: String,
+        extraFiles: [(guestPath: String, content: String)],
+        outputURL: URL
+    ) throws {
         let fm = FileManager.default
-        let tempDir = fm.temporaryDirectory.appendingPathComponent("linux-disk-vm-cpio-\(UUID().uuidString)")
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("tuxdisk-cpio-\(UUID().uuidString)")
         try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tempDir) }
 
         let initFile = tempDir.appendingPathComponent("init")
         try writeExecutableScript(initScriptContent, to: initFile)
 
+        for item in extraFiles {
+            let dest = tempDir.appendingPathComponent("overlay-files").appendingPathComponent(item.guestPath)
+            try writeExecutableScript(item.content, to: dest)
+        }
+
         let overlayGz = tempDir.appendingPathComponent("overlay.cpio.gz")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")
         proc.currentDirectoryURL = tempDir
-        proc.arguments = ["-c", "echo init | /usr/bin/cpio -o -H newc 2>/dev/null | /usr/bin/gzip -1 > \"\(overlayGz.path)\""]
+        proc.arguments = [
+            "-c",
+            "find init overlay-files -print 2>/dev/null | /usr/bin/cpio -o -H newc 2>/dev/null | /usr/bin/gzip -1 > \"\(overlayGz.path)\""
+        ]
         try proc.run()
         proc.waitUntilExit()
 
@@ -254,21 +299,23 @@ public enum ImageBuilder {
         try outHandle.write(contentsOf: overlayData)
     }
 
-    /// Fast runtime `/init` inside `initramfs-boot.img`: loads virtio_blk + ext4, mounts `/dev/vda`, and `switch_root`s into `/sbin/vm-init`.
     private static let runtimeOverlayInitScript = #"""
 #!/bin/sh
+/bin/busybox mkdir -p /bin /sbin /usr/bin /usr/sbin /proc /sys /dev /ro /rw /sysroot
+/bin/busybox --install -s
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+trap 'poweroff -f' EXIT
+
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
-for mod in virtio_pci virtio_blk ext4; do
+for mod in virtio_pci virtio_blk ext4 crc32c overlay; do
     modprobe "$mod" 2>/dev/null || true
 done
 
 mdev -s 2>/dev/null || true
 
-# Wait up to 3 seconds for /dev/vda
 i=0
 while [ ! -b /dev/vda ] && [ $i -lt 30 ]; do
     sleep 0.1
@@ -276,21 +323,41 @@ while [ ! -b /dev/vda ] && [ $i -lt 30 ]; do
     i=$((i + 1))
 done
 
-mkdir -p /sysroot
-mount -t ext4 -o rw /dev/vda /sysroot
+if mount -t ext4 -o ro,noload /dev/vda /ro 2>/dev/null || mount -t ext4 -o ro /dev/vda /ro 2>/dev/null; then
+    mount -t tmpfs -o size=256M,mode=0755 tmpfs /rw
+    mkdir -p /rw/upper /rw/work
+    if mount -t overlay overlay -o lowerdir=/ro,upperdir=/rw/upper,workdir=/rw/work /sysroot 2>/dev/null; then
+        mkdir -p /sysroot/.ro /sysroot/.rw
+        mount -o move /ro /sysroot/.ro 2>/dev/null || true
+        mount -o move /rw /sysroot/.rw 2>/dev/null || true
+    else
+        umount /ro 2>/dev/null || true
+        mount -t ext4 -o rw /dev/vda /sysroot
+    fi
+else
+    mount -t ext4 -o rw /dev/vda /sysroot
+fi
 
-mount --move /dev /sysroot/dev 2>/dev/null || true
-mount --move /proc /sysroot/proc 2>/dev/null || true
-mount --move /sys /sysroot/sys 2>/dev/null || true
+# Sync latest guest scripts from overlay-files into rootfs
+if [ -d /overlay-files ]; then
+    cp -af /overlay-files/. /sysroot/ 2>/dev/null || true
+fi
 
+mount -o move /dev /sysroot/dev 2>/dev/null || true
+mount -o move /proc /sysroot/proc 2>/dev/null || true
+mount -o move /sys /sysroot/sys 2>/dev/null || true
+
+trap - EXIT
 exec switch_root /sysroot /sbin/vm-init
 """#
 
-    /// One-time bootstrap `/init` that formats `/dev/vda` as ext4 and installs Alpine + all Linux filesystem & volume packages.
     private static let bootstrapOverlayInitScript = #"""
 #!/bin/sh
-set -e
+/bin/busybox mkdir -p /bin /sbin /usr/bin /usr/sbin /proc /sys /dev /tmp /mnt/setup /mnt/target
+/bin/busybox --install -s
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+set -e
+trap 'echo "==> [Bootstrap VM] Error occurred, shutting down..."; poweroff -f' EXIT
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -308,7 +375,7 @@ mdev -s 2>/dev/null || true
 echo "==> [Bootstrap VM] Configuring NAT networking..."
 ip link set lo up
 ip link set eth0 up
-udhcpc -i eth0 -q -s /usr/share/udhcpc/default.script 2>/dev/null || udhcpc -i eth0 -q
+udhcpc -i eth0 -f -q -s /usr/share/udhcpc/default.script 2>/dev/null || udhcpc -i eth0 -f -q
 
 echo "==> [Bootstrap VM] Mounting host setup share..."
 mount -t virtiofs setup /mnt/setup
@@ -318,9 +385,9 @@ mkdir -p /tmp/stage
 tar -xzf /mnt/setup/alpine-minirootfs.tar.gz -C /tmp/stage
 cp /etc/resolv.conf /tmp/stage/etc/resolv.conf
 
-mount --bind /proc /tmp/stage/proc
-mount --bind /sys /tmp/stage/sys
-mount --bind /dev /tmp/stage/dev
+mount -o bind /proc /tmp/stage/proc
+mount -o bind /sys /tmp/stage/sys
+mount -o bind /dev /tmp/stage/dev
 
 echo "==> [Bootstrap VM] Installing kernel modules and filesystem packages via apk..."
 chroot /tmp/stage /bin/sh -e <<'CHROOT_EOF'
@@ -328,6 +395,7 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 apk update
 apk add --no-cache \
     linux-virt \
+    mkinitfs \
     e2fsprogs e2fsprogs-extra \
     btrfs-progs \
     xfsprogs \
@@ -339,51 +407,46 @@ apk add --no-cache \
     dosfstools exfatprogs ntfs-3g \
     rsync file tree mc nano \
     bash coreutils grep sed gawk tar gzip zstd xz
+
+mkdir -p /etc/mkinitfs
+echo 'features="base virtio ext4 btrfs xfs lvm cryptsetup"' > /etc/mkinitfs/mkinitfs.conf
+KVER=$(ls /lib/modules | head -n 1)
+mkinitfs -o /boot/initramfs-virt "$KVER"
 CHROOT_EOF
 
-echo "==> [Bootstrap VM] Formatting /dev/vda (rootfs.img) as ext4..."
-chroot /tmp/stage /sbin/mkfs.ext4 -F -q -L "linux-vm-root" /dev/vda
-
+echo "==> [Bootstrap VM] Preparing rootfs files in /tmp/stage..."
 umount /tmp/stage/dev
 umount /tmp/stage/sys
 umount /tmp/stage/proc
 
-echo "==> [Bootstrap VM] Populating persistent rootfs on /dev/vda..."
-mount -t ext4 /dev/vda /mnt/target
-cp -a /tmp/stage/. /mnt/target/
-mkdir -p /mnt/target/proc /mnt/target/sys /mnt/target/dev /mnt/target/run /mnt/target/tmp /mnt/target/mnt/host /mnt/target/mnt/disks /mnt/target/usr/local/bin
+mkdir -p /tmp/stage/proc /tmp/stage/sys /tmp/stage/dev /tmp/stage/run /tmp/stage/tmp /tmp/stage/mnt/host /tmp/stage/mnt/disks /tmp/stage/usr/local/bin
 
-# Install our custom init and disk management scripts
-cp /mnt/setup/guest-scripts/vm-init /mnt/target/sbin/vm-init
-chmod 755 /mnt/target/sbin/vm-init
+cp /mnt/setup/guest-scripts/vm-init /tmp/stage/sbin/vm-init
+chmod 755 /tmp/stage/sbin/vm-init
 
-for s in disks mount-disk unmount-all; do
-    cp "/mnt/setup/guest-scripts/$s" "/mnt/target/usr/local/bin/$s"
-    chmod 755 "/mnt/target/usr/local/bin/$s"
+for s in disks mount-disk unmount-all check-disk luks-info probe-disks; do
+    if [ -f "/mnt/setup/guest-scripts/$s" ]; then
+        cp "/mnt/setup/guest-scripts/$s" "/tmp/stage/usr/local/bin/$s"
+        chmod 755 "/tmp/stage/usr/local/bin/$s"
+    fi
 done
 
-# Configure root shell prompt and environment
-cat > /mnt/target/root/.bash_profile <<'PROFILE_EOF'
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export PS1='\[\033[1;36m\]linux-disk-vm\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]# '
-alias ll='ls -lah --color=auto'
-alias ls='ls --color=auto'
-PROFILE_EOF
+if [ -f /tmp/stage/boot/vmlinuz-virt ]; then
+    cp /tmp/stage/boot/vmlinuz-virt /mnt/setup/installed-vmlinuz-virt
+fi
+if [ -f /tmp/stage/boot/initramfs-virt ]; then
+    cp /tmp/stage/boot/initramfs-virt /mnt/setup/installed-initramfs-virt
+fi
 
-# Export matching kernel & initramfs from linux-virt package back to host
-if [ -f /mnt/target/boot/vmlinuz-virt ]; then
-    cp /mnt/target/boot/vmlinuz-virt /mnt/setup/installed-vmlinuz-virt
-fi
-if [ -f /mnt/target/boot/initramfs-virt ]; then
-    cp /mnt/target/boot/initramfs-virt /mnt/setup/installed-initramfs-virt
-fi
+echo "==> [Bootstrap VM] Writing ext4 root filesystem to /dev/vda (rootfs.img)..."
+LD_LIBRARY_PATH="/tmp/stage/lib:/tmp/stage/usr/lib" /tmp/stage/sbin/mkfs.ext4 -F -q -L "tuxdisk-root" -d /tmp/stage /dev/vda
 
 sync
-umount /mnt/target
 touch /mnt/setup/.setup-done
 sync
 umount /mnt/setup
 echo "==> [Bootstrap VM] Provisioning finished successfully!"
+trap - EXIT
 poweroff -f
 """#
 }

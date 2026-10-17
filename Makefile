@@ -1,11 +1,11 @@
-BINARY_NAME := linux-disk-vm
+BINARY_NAME := tuxdisk
 BIN_DIR := bin
 TARGET_BIN := $(BIN_DIR)/$(BINARY_NAME)
-MODULE_CACHE := /tmp/linux-disk-vm-module-cache
-SOURCES := $(wildcard Sources/linux_disk_vm/*.swift)
+MODULE_CACHE := /tmp/tuxdisk-module-cache
+SOURCES := $(wildcard Sources/tuxdisk/*.swift)
 PREFIX ?= /usr/local
 
-.PHONY: all build sign setup list clean install
+.PHONY: all build sign setup list doctor clean install
 
 all: sign
 
@@ -15,6 +15,7 @@ build: $(SOURCES)
 
 sign: build
 	codesign --entitlements entitlements.plist --force -s - $(TARGET_BIN)
+	@ln -sf $(BINARY_NAME) $(BIN_DIR)/linux-disk-vm
 	@echo "==> Built and signed $(TARGET_BIN)"
 
 setup: sign
@@ -22,6 +23,9 @@ setup: sign
 
 list: sign
 	./$(TARGET_BIN) list
+
+doctor: sign
+	./$(TARGET_BIN) doctor
 
 install: sign
 	install -d $(PREFIX)/bin

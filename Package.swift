@@ -2,23 +2,23 @@
 import PackageDescription
 
 let package = Package(
-    name: "linux-disk-vm",
+    name: "tuxdisk",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "linux-disk-vm", targets: ["linux_disk_vm"])
+        .executable(name: "tuxdisk", targets: ["tuxdisk"])
     ],
     targets: [
         .executableTarget(
-            name: "linux_disk_vm",
+            name: "tuxdisk",
             linkerSettings: [
                 .linkedFramework("Virtualization")
             ]
         ),
         .testTarget(
-            name: "linux_disk_vmTests",
-            dependencies: ["linux_disk_vm"]
+            name: "tuxdiskTests",
+            dependencies: ["tuxdisk"]
         ),
     ]
 )
