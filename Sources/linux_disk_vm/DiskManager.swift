@@ -128,7 +128,14 @@ public enum DiskManager {
         print("Discovered macOS Disks:")
         print(String(repeating: "─", count: 78))
         for disk in disks {
-            let locationTag = disk.isInternal ? "\u{001B}[33m[INTERNAL - PROTECTED]\u{001B}[0m" : "\u{001B}[32m[EXTERNAL]\u{001B}[0m"
+            let locationTag: String
+            if disk.isInternal {
+                locationTag = "\u{001B}[33m[INTERNAL - PROTECTED]\u{001B}[0m"
+            } else if disk.busProtocol == "Disk Image" {
+                locationTag = "\u{001B}[35m[MACOS DISK IMAGE]\u{001B}[0m"
+            } else {
+                locationTag = "\u{001B}[32m[EXTERNAL DRIVE]\u{001B}[0m"
+            }
             let sizeStr = ByteCountFormatter.string(fromByteCount: disk.size, countStyle: .file)
             print("  /dev/\(disk.deviceIdentifier)  (\(disk.mediaName), \(sizeStr), \(disk.busProtocol)) \(locationTag)")
 

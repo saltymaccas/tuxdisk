@@ -38,11 +38,19 @@ public enum ImageBuilder {
     public static let alpineVersion = "3.21.3"
     public static let alpineMirror = "https://dl-cdn.alpinelinux.org/alpine"
 
-    /// Resolves the assets directory, respecting `LINUX_DISK_VM_HOME` and `SUDO_USER` so running with `sudo` finds the user's setup files.
+    /// Resolves the assets directory, respecting `LINUX_DISK_VM_HOME`, project-local `.vm-assets`, and `SUDO_USER`.
     public static func defaultAssetsDirectory() -> URL {
         let env = ProcessInfo.processInfo.environment
         if let customHome = env["LINUX_DISK_VM_HOME"], !customHome.isEmpty {
             return URL(fileURLWithPath: customHome)
+        }
+        // Check if running from <repo>/bin/linux-disk-vm where <repo>/Package.swift exists
+        if let execPath = CommandLine.arguments.first {
+            let execURL = URL(fileURLWithPath: execPath).standardizedFileURL
+            let repoCandidate = execURL.deletingLastPathComponent().deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: repoCandidate.appendingPathComponent("Package.swift").path) {
+                return repoCandidate.appendingPathComponent(".vm-assets")
+            }
         }
         if let sudoUser = env["SUDO_USER"], !sudoUser.isEmpty, sudoUser != "root" {
             let sudoHome = URL(fileURLWithPath: "/Users/\(sudoUser)")
