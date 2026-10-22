@@ -436,4 +436,242 @@ public enum Operations {
             ConsoleStyle.success("All checks passed! tuxdisk is ready.")
         }
     }
+
+    /// `tuxdisk browse <disk...> [--read-only] [--mount-point <dir>] [--port <port>] [--no-open]`
+    @MainActor
+    public static func browseDisks(
+        _ disks: [String],
+        readOnly: Bool,
+        allowInternal: Bool,
+        passphrase: String?,
+        mountPoint: String?,
+        preferredPort: UInt16,
+        openFinder: Bool,
+        cpuCount: Int = 2,
+        memoryMB: UInt64 = 2048
+    ) async throws {
+        guard !disks.isEmpty else {
+            throw NSError(domain: "tuxdisk", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Please specify at least one disk or image to browse in Finder (e.g. 'sudo tuxdisk browse /dev/disk4')."
+            ])
+        }
+
+        let assets = try await ImageBuilder.ensurePrepared(force: false)
+        let winSize = TerminalManager.currentWindowSize()
+        let termEnv = ProcessInfo.processInfo.environment["TERM"] ?? "xterm-256color"
+
+        var cmdlineParts = [
+            "console=hvc0",
+            "quiet",
+            "TERM=\(termEnv)",
+            "vm.cols=\(winSize.cols)",
+            "vm.rows=\(winSize.rows)",
+            "vm.ro=\(readOnly ? 1 : 0)",
+            "vm.bridge=1",
+            "vm.browse_only=1"
+        ]
+
+        if let pass = passphrase {
+            let passB64 = Data(pass.utf8).base64EncodedString()
+            cmdlineParts.append("vm.pass64=\(passB64)")
+        }
+
+        let bridgePipes = SerialBridgePipes()
+        let controller = FinderSessionController(
+            pipes: bridgePipes,
+            readOnly: readOnly,
+            mountPoint: mountPoint,
+            preferredPort: preferredPort,
+            openFinder: openFinder,
+            isBrowseOnly: true
+        )
+        defer {
+            controller.cleanup()
+        }
+
+        let vmOpts = VMConfigurationOptions(
+            kernelURL: assets.rawKernelURL,
+            initrdURL: assets.bootInitrdURL,
+            rootDiskURL: assets.rootDiskURL,
+            rootDiskReadOnly: true,
+            externalDisks: disks,
+            externalDisksReadOnly: readOnly,
+            allowInternalDisks: allowInternal,
+            sharedDirectories: [],
+            cpuCount: cpuCount,
+            memorySizeMB: memoryMB,
+            kernelCommandLine: cmdlineParts.joined(separator: " "),
+            rawTerminal: true,
+            quietAttachmentLogs: false,
+            bridgePipes: bridgePipes,
+            onVMStarted: {
+                controller.startBridgeAsync()
+            }
+        )
+
+        try await VMRunner.run(options: vmOpts)
+        if let startupError = controller.startupError {
+            throw startupError
+        }
+    }
+}
+
+/// Manages the lifecycle of the host WebDAV server, Finder volume mount, and signal/eject watchers
+public final class FinderSessionController: @unchecked Sendable {
+    public let client: SerialGuestFSClient
+    public let readOnly: Bool
+    public let mountPoint: String?
+    public let preferredPort: UInt16
+    public let openFinder: Bool
+    public let isBrowseOnly: Bool
+
+    private let lock = NSLock()
+    private var server: FinderWebDAVServer? = nil
+    private var mounter: FinderMounter? = nil
+    private var sigIntSource: DispatchSourceSignal? = nil
+    private var sigTermSource: DispatchSourceSignal? = nil
+    private var ejectTimer: DispatchSourceTimer? = nil
+    private var cleanedUp = false
+    public private(set) var startupError: Error? = nil
+
+    public init(
+        pipes: SerialBridgePipes,
+        readOnly: Bool,
+        mountPoint: String?,
+        preferredPort: UInt16,
+        openFinder: Bool,
+        isBrowseOnly: Bool
+    ) {
+        self.client = SerialGuestFSClient(readHandle: pipes.hostReadHandle, writeHandle: pipes.hostWriteHandle)
+        self.readOnly = readOnly
+        self.mountPoint = mountPoint
+        self.preferredPort = preferredPort
+        self.openFinder = openFinder
+        self.isBrowseOnly = isBrowseOnly
+    }
+
+    public func startBridgeAsync() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let volumeLabel = try self.client.waitUntilReady(timeoutSeconds: 180.0)
+                if self.isBrowseOnly {
+                    TerminalManager.shared.restore()
+                }
+
+                let webdav = FinderWebDAVServer(
+                    backend: self.client,
+                    readOnly: self.readOnly,
+                    suppressMacMetadata: true
+                )
+                try webdav.start(preferredPort: self.preferredPort)
+
+                let finderMounter = FinderMounter(
+                    volumeLabel: volumeLabel,
+                    webdavURLString: webdav.baseURLString,
+                    customMountPoint: self.mountPoint
+                )
+                try finderMounter.mountAndOpenInFinder(openWindow: self.openFinder)
+
+                self.lock.lock()
+                self.server = webdav
+                self.mounter = finderMounter
+                self.lock.unlock()
+
+                if self.isBrowseOnly {
+                    print("")
+                    print("\(ConsoleStyle.boldCyan)╭────────────────────────────────────────────────────────────────────────────╮\(ConsoleStyle.reset)")
+                    print("\(ConsoleStyle.boldCyan)│\(ConsoleStyle.reset)  \(ConsoleStyle.boldWhite)tuxdisk browse\(ConsoleStyle.reset) — Linux Volume Mounted in macOS Finder                     \(ConsoleStyle.boldCyan)│\(ConsoleStyle.reset)")
+                    print("\(ConsoleStyle.boldCyan)╰────────────────────────────────────────────────────────────────────────────╯\(ConsoleStyle.reset)")
+                    print("  \(ConsoleStyle.boldGreen)● Volume Label:\(ConsoleStyle.reset)  \(ConsoleStyle.boldWhite)\(finderMounter.volumeLabel)\(ConsoleStyle.reset)")
+                    if finderMounter.isMountedOnHost {
+                        print("  \(ConsoleStyle.boldGreen)● Finder Mount:\(ConsoleStyle.reset)  \(ConsoleStyle.boldWhite)\(finderMounter.mountPointURL.path)\(ConsoleStyle.reset)")
+                    }
+                    print("  \(ConsoleStyle.boldGreen)● WebDAV URL:\(ConsoleStyle.reset)    \(webdav.baseURLString)")
+                    let modeText = self.readOnly
+                        ? "\(ConsoleStyle.boldYellow)READ-ONLY\(ConsoleStyle.reset)"
+                        : "\(ConsoleStyle.boldGreen)READ-WRITE\(ConsoleStyle.reset) (.DS_Store / ._ clutter suppressed)"
+                    print("  \(ConsoleStyle.boldGreen)● Access Mode:\(ConsoleStyle.reset)   \(modeText)")
+                    print("")
+                    ConsoleStyle.info("Press Ctrl+C (or Eject \"\(finderMounter.volumeLabel)\" in Finder) to sync, unmount, and exit.")
+                    fflush(stdout)
+                    self.installSignalAndEjectHandlers()
+                }
+            } catch {
+                if self.isBrowseOnly {
+                    TerminalManager.shared.restore()
+                }
+                self.lock.lock()
+                self.startupError = error
+                self.lock.unlock()
+                try? self.client.shutdown()
+            }
+        }
+    }
+
+    private func installSignalAndEjectHandlers() {
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+
+        let sigInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global(qos: .userInitiated))
+        sigInt.setEventHandler { [weak self] in
+            print("\n\(ConsoleStyle.boldCyan)==> [tuxdisk] Unmounting Finder volume and syncing Linux disk...\(ConsoleStyle.reset)")
+            self?.cleanup()
+        }
+        sigInt.resume()
+
+        let sigTerm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global(qos: .userInitiated))
+        sigTerm.setEventHandler { [weak self] in
+            self?.cleanup()
+        }
+        sigTerm.resume()
+
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 2.0, repeating: 1.5)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let currentMounter = self.mounter
+            self.lock.unlock()
+            if let currentMounter, currentMounter.isMountedOnHost && !currentMounter.isStillMounted() {
+                print("\n\(ConsoleStyle.boldCyan)==> [tuxdisk] Volume ejected in Finder; syncing Linux disk and shutting down...\(ConsoleStyle.reset)")
+                self.cleanup()
+            }
+        }
+        timer.resume()
+
+        lock.lock()
+        self.sigIntSource = sigInt
+        self.sigTermSource = sigTerm
+        self.ejectTimer = timer
+        lock.unlock()
+    }
+
+    public func cleanup() {
+        lock.lock()
+        if cleanedUp {
+            lock.unlock()
+            return
+        }
+        cleanedUp = true
+        let currentMounter = mounter
+        let currentServer = server
+        let sigInt = sigIntSource
+        let sigTerm = sigTermSource
+        let timer = ejectTimer
+        mounter = nil
+        server = nil
+        sigIntSource = nil
+        sigTermSource = nil
+        ejectTimer = nil
+        lock.unlock()
+
+        timer?.cancel()
+        sigInt?.cancel()
+        sigTerm?.cancel()
+
+        currentMounter?.unmountAndCleanup()
+        currentServer?.stop()
+        try? client.shutdown()
+    }
 }

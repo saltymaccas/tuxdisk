@@ -424,7 +424,7 @@ mkdir -p /tmp/stage/proc /tmp/stage/sys /tmp/stage/dev /tmp/stage/run /tmp/stage
 cp /mnt/setup/guest-scripts/vm-init /tmp/stage/sbin/vm-init
 chmod 755 /tmp/stage/sbin/vm-init
 
-for s in disks mount-disk unmount-all check-disk luks-info probe-disks; do
+for s in disks mount-disk unmount-all check-disk luks-info probe-disks fs-bridge; do
     if [ -f "/mnt/setup/guest-scripts/$s" ]; then
         cp "/mnt/setup/guest-scripts/$s" "/tmp/stage/usr/local/bin/$s"
         chmod 755 "/tmp/stage/usr/local/bin/$s"

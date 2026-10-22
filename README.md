@@ -42,7 +42,8 @@ sudo make install
 | Command | Description |
 | :--- | :--- |
 | `tuxdisk list [--external] [--json]` | List macOS block devices, partition tables, and highlight Linux volumes |
-| `sudo tuxdisk [shell] <disk...> [opts]` | Boot interactive Linux shell with external drive(s) attached |
+| `sudo tuxdisk browse <disk...> [opts]` | Mount Linux drive(s) as a native macOS volume and open in **Finder** |
+| `sudo tuxdisk [shell] <disk...> [opts]` | Boot interactive Linux shell with external drive(s) attached (`--browse` to also open in Finder) |
 | `sudo tuxdisk inspect <disk...>` | Probe partition tables, `blkid` UUIDs, LVM2 groups, LUKS headers & disk usage |
 | `sudo tuxdisk copy <src> <dst>` | Copy files/folders directly between a Linux drive (`<disk>:<path>`) and macOS |
 | `sudo tuxdisk check <disk> [--repair]` | Run filesystem integrity checks (`e2fsck`, `btrfs check`, `xfs_repair`, `fsck.f2fs`) |
@@ -64,7 +65,22 @@ sudo make install
 ./bin/tuxdisk list --json
 ```
 
-### 2. Deep-Inspect an External Drive or Image Without Mounting on macOS
+### 2. Browse Linux Drives Directly in macOS Finder (`tuxdisk browse`)
+
+```bash
+# Mount /dev/disk4 (ext4, Btrfs, XFS, F2FS, LUKS2, or LVM2) and open in macOS Finder:
+sudo ./bin/tuxdisk browse /dev/disk4
+
+# Mount in read-only mode or at a custom macOS directory:
+sudo ./bin/tuxdisk browse /dev/disk4 --read-only --mount-point ~/Volumes/LinuxDrive
+```
+
+- Automatically unlocks LUKS containers (prompting for passphrase if encrypted) and activates LVM2 volume groups.
+- Mounts via macOS's built-in `mount_webdav` bridge with zero third-party kernel extensions required.
+- Suppresses `.DS_Store`, `._*` AppleDouble, `.Spotlight-V100`, and `.Trashes` clutter so your Linux disk stays clean.
+- Press `Ctrl+C` (or click **Eject** in Finder) to flush writes, unmount the volume, and power off the VM cleanly.
+
+### 3. Deep-Inspect an External Drive or Image Without Mounting on macOS
 
 ```bash
 sudo ./bin/tuxdisk inspect /dev/disk4
@@ -72,11 +88,14 @@ sudo ./bin/tuxdisk inspect /dev/disk4
 
 Outputs the GPT/MBR partition layout, `blkid` filesystem signatures, LVM2 PV/VG/LV hierarchy, LUKS encryption header summary, space usage (`df -hT`), and top-level directory listing.
 
-### 3. Interactive Shell Session
+### 4. Interactive Shell Session (with Optional Finder Mount)
 
 ```bash
 # Read-write session with current macOS directory shared at /mnt/host:
 sudo ./bin/tuxdisk /dev/disk4
+
+# Interactive Linux shell AND macOS Finder volume mounted simultaneously:
+sudo ./bin/tuxdisk /dev/disk4 --browse
 
 # Read-only session with automatic partition mounting and ~/Downloads shared at /mnt/host:
 sudo ./bin/tuxdisk /dev/disk4 --read-only --auto-mount --share ~/Downloads

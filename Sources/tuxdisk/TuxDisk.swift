@@ -3,6 +3,7 @@ import Foundation
 public struct CLIOptions: Sendable {
     public enum Subcommand: Sendable {
         case list
+        case browse
         case inspect
         case check
         case copy(source: String, destination: String)
@@ -27,6 +28,12 @@ public struct CLIOptions: Sendable {
     public var memoryMB: UInt64 = 2048
     public var execCommand: String? = nil
 
+    // Flags for Finder browsing
+    public var browseInFinder: Bool = false
+    public var mountPoint: String? = nil
+    public var webdavPort: UInt16 = 0
+    public var noOpenFinder: Bool = false
+
     // Flags for list
     public var externalOnly: Bool = false
     public var jsonOutput: Bool = false
@@ -42,9 +49,11 @@ public struct CLIOptions: Sendable {
     public var yesConfirm: Bool = false
 }
 
+#if !TUXDISK_TEST_RUNNER
 @main
+#endif
 struct TuxDisk {
-    static let version = "1.1.0"
+    static let version = "1.2.0"
 
     static func main() async {
         do {
@@ -56,6 +65,18 @@ struct TuxDisk {
                 print("tuxdisk \(version) (Apple Virtualization.framework / ARM64)")
             case .list:
                 try DiskManager.printDiskList(externalOnly: options.externalOnly, asJSON: options.jsonOutput)
+            case .browse:
+                try await Operations.browseDisks(
+                    options.disks,
+                    readOnly: options.readOnly,
+                    allowInternal: options.allowInternal,
+                    passphrase: options.passphrase,
+                    mountPoint: options.mountPoint,
+                    preferredPort: options.webdavPort,
+                    openFinder: !options.noOpenFinder,
+                    cpuCount: options.cpuCount,
+                    memoryMB: options.memoryMB
+                )
             case .inspect:
                 try await Operations.inspectDisks(options.disks, allowInternal: options.allowInternal)
             case .check:
@@ -113,6 +134,30 @@ struct TuxDisk {
                     "vm.hostpath=\(hostShareURL.path)"
                 ]
 
+                if let pass = options.passphrase {
+                    let passB64 = Data(pass.utf8).base64EncodedString()
+                    cmdlineParts.append("vm.pass64=\(passB64)")
+                }
+
+                var bridgePipes: SerialBridgePipes? = nil
+                var finderController: FinderSessionController? = nil
+                if options.browseInFinder && !options.disks.isEmpty {
+                    cmdlineParts.append("vm.bridge=1")
+                    let pipes = SerialBridgePipes()
+                    bridgePipes = pipes
+                    finderController = FinderSessionController(
+                        pipes: pipes,
+                        readOnly: options.readOnly,
+                        mountPoint: options.mountPoint,
+                        preferredPort: options.webdavPort,
+                        openFinder: !options.noOpenFinder,
+                        isBrowseOnly: false
+                    )
+                }
+                defer {
+                    finderController?.cleanup()
+                }
+
                 if let execCmd = options.execCommand {
                     let b64 = Data(execCmd.utf8).base64EncodedString()
                     cmdlineParts.append("vm.exec64=\(b64)")
@@ -123,6 +168,7 @@ struct TuxDisk {
                     ? []
                     : [("host", hostShareURL, false)]
 
+                let capturedController = finderController
                 let vmOptions = VMConfigurationOptions(
                     kernelURL: assets.rawKernelURL,
                     initrdURL: assets.bootInitrdURL,
@@ -135,7 +181,11 @@ struct TuxDisk {
                     cpuCount: options.cpuCount,
                     memorySizeMB: options.memoryMB,
                     kernelCommandLine: cmdlineParts.joined(separator: " "),
-                    rawTerminal: isInteractive
+                    rawTerminal: isInteractive,
+                    bridgePipes: bridgePipes,
+                    onVMStarted: {
+                        capturedController?.startBridgeAsync()
+                    }
                 )
 
                 try await VMRunner.run(options: vmOptions)
@@ -156,6 +206,7 @@ struct TuxDisk {
         if let first = args.first, !first.hasPrefix("-") {
             let knownSubcommands: Set<String> = [
                 "list", "ls", "disks",
+                "browse", "mount", "finder",
                 "inspect", "info", "probe",
                 "check", "fsck", "repair",
                 "copy", "cp", "pull", "push",
@@ -193,6 +244,22 @@ struct TuxDisk {
                 opts.readOnly = true
             case "-a", "--auto-mount":
                 opts.autoMount = true
+            case "-b", "--browse", "--finder":
+                opts.browseInFinder = true
+            case "--no-open":
+                opts.noOpenFinder = true
+            case "--mount-point":
+                idx += 1
+                guard idx < args.count else {
+                    throw cliError("Missing value for --mount-point")
+                }
+                opts.mountPoint = args[idx]
+            case "--port":
+                idx += 1
+                guard idx < args.count, let p = UInt16(args[idx]) else {
+                    throw cliError("Invalid value for --port")
+                }
+                opts.webdavPort = p
             case "--no-share":
                 opts.noShare = true
             case "--allow-internal":
@@ -271,6 +338,9 @@ struct TuxDisk {
         switch explicitSubcommand {
         case "list", "ls", "disks":
             opts.subcommand = .list
+        case "browse", "mount", "finder":
+            opts.disks.append(contentsOf: positional)
+            opts.subcommand = .browse
         case "inspect", "info", "probe":
             opts.disks.append(contentsOf: positional)
             opts.subcommand = .inspect
@@ -330,10 +400,11 @@ struct TuxDisk {
           • ext4, ext3, ext2 (e2fsprogs)      • Btrfs & subvolumes (btrfs-progs)
           • XFS (xfsprogs)                    • F2FS (f2fs-tools)
           • LUKS1 / LUKS2 (cryptsetup)        • LVM2 volume groups (lvm2)
-          • FAT32 / exFAT / NTFS              • macOS VirtioFS shared folders
+          • FAT32 / exFAT / NTFS              • macOS Finder WebDAV & VirtioFS
 
         \(ConsoleStyle.boldWhite)COMMANDS:\(ConsoleStyle.reset)
           \(ConsoleStyle.cyan)tuxdisk list\(ConsoleStyle.reset) [--external] [--json]        List macOS block devices & highlight Linux partitions
+          \(ConsoleStyle.cyan)tuxdisk browse\(ConsoleStyle.reset) <disk...> [options]        Mount Linux drive(s) as a volume in macOS Finder
           \(ConsoleStyle.cyan)tuxdisk [shell]\(ConsoleStyle.reset) [disks...] [options]      Boot interactive Linux shell with external drive(s)
           \(ConsoleStyle.cyan)tuxdisk inspect\(ConsoleStyle.reset) <disk...>                 Probe partition tables, UUIDs, LVM/LUKS & disk usage
           \(ConsoleStyle.cyan)tuxdisk copy\(ConsoleStyle.reset) <src> <dst>                  Copy files between a Linux drive (<disk>:<path>) and macOS
@@ -344,8 +415,12 @@ struct TuxDisk {
           \(ConsoleStyle.cyan)tuxdisk doctor\(ConsoleStyle.reset)                            Verify virtualization support, assets & guest tools
           \(ConsoleStyle.cyan)tuxdisk setup\(ConsoleStyle.reset) [--force]                   Download & build the Alpine Linux VM rootfs image
 
-        \(ConsoleStyle.boldWhite)SHELL / GENERAL OPTIONS:\(ConsoleStyle.reset)
+        \(ConsoleStyle.boldWhite)FINDER / SHELL / GENERAL OPTIONS:\(ConsoleStyle.reset)
           -d, --disk <path>       Attach a raw block device (e.g. /dev/disk4) or image file (.img)
+          -b, --browse, --finder  Mount attached Linux drive(s) in macOS Finder alongside shell
+          --mount-point <dir>     Custom macOS directory for Finder WebDAV mount (default: ~/Volumes/<label>)
+          --port <port>           Localhost port for embedded WebDAV bridge (default: auto)
+          --no-open               Mount volume without automatically opening a Finder window
           -r, --read-only         Attach external drive(s) in read-only mode
           -a, --auto-mount        Automatically mount non-encrypted partitions under /mnt/disks/
           -s, --share <dir>       Share a macOS directory at /mnt/host via VirtioFS (default: current dir)
@@ -366,16 +441,19 @@ struct TuxDisk {
           \(ConsoleStyle.dim)# 1. Discover connected external drives on macOS:\(ConsoleStyle.reset)
           tuxdisk list
 
-          \(ConsoleStyle.dim)# 2. Inspect partitions, LUKS headers, LVM volumes, and files on /dev/disk4:\(ConsoleStyle.reset)
+          \(ConsoleStyle.dim)# 2. Mount and browse an external Linux drive directly in macOS Finder:\(ConsoleStyle.reset)
+          sudo tuxdisk browse /dev/disk4
+
+          \(ConsoleStyle.dim)# 3. Inspect partitions, LUKS headers, LVM volumes, and files on /dev/disk4:\(ConsoleStyle.reset)
           sudo tuxdisk inspect /dev/disk4
 
-          \(ConsoleStyle.dim)# 3. Enter interactive Linux shell with /dev/disk4 attached:\(ConsoleStyle.reset)
-          sudo tuxdisk /dev/disk4
+          \(ConsoleStyle.dim)# 4. Enter interactive Linux shell AND browse in macOS Finder simultaneously:\(ConsoleStyle.reset)
+          sudo tuxdisk /dev/disk4 --browse
 
-          \(ConsoleStyle.dim)# 4. Copy a folder directly from an external Linux drive to macOS:\(ConsoleStyle.reset)
+          \(ConsoleStyle.dim)# 5. Copy a folder directly from an external Linux drive to macOS:\(ConsoleStyle.reset)
           sudo tuxdisk copy /dev/disk4:/home/alice/Photos ~/Downloads/Photos
 
-          \(ConsoleStyle.dim)# 5. Create an encrypted 1GB Btrfs + LUKS2 + LVM2 disk image:\(ConsoleStyle.reset)
+          \(ConsoleStyle.dim)# 6. Create an encrypted 1GB Btrfs + LUKS2 + LVM2 disk image:\(ConsoleStyle.reset)
           tuxdisk create-image vault.img --size 1G --fs btrfs --label Vault --luks --lvm
         """)
     }

@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "tuxdisk",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "tuxdisk", targets: ["tuxdisk"])

@@ -5,7 +5,7 @@ MODULE_CACHE := /tmp/tuxdisk-module-cache
 SOURCES := $(wildcard Sources/tuxdisk/*.swift)
 PREFIX ?= /usr/local
 
-.PHONY: all build sign setup list doctor clean install
+.PHONY: all build sign test setup list doctor clean install
 
 all: sign
 
@@ -17,6 +17,12 @@ sign: build
 	codesign --entitlements entitlements.plist --force -s - $(TARGET_BIN)
 	@ln -sf $(BINARY_NAME) $(BIN_DIR)/linux-disk-vm
 	@echo "==> Built and signed $(TARGET_BIN)"
+
+test: $(SOURCES) Tests/tuxdiskTests/tuxdiskTests.swift
+	@mkdir -p $(BIN_DIR) $(MODULE_CACHE)
+	swiftc -module-cache-path $(MODULE_CACHE) -DTUXDISK_TEST_RUNNER -framework Virtualization $(SOURCES) Tests/tuxdiskTests/tuxdiskTests.swift -o $(BIN_DIR)/tuxdisk-tests
+	codesign --entitlements entitlements.plist --force -s - $(BIN_DIR)/tuxdisk-tests
+	./$(BIN_DIR)/tuxdisk-tests
 
 setup: sign
 	./$(TARGET_BIN) setup

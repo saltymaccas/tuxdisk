@@ -10,7 +10,8 @@ public enum GuestScripts {
             ("usr/local/bin/unmount-all", unmountAllScript),
             ("usr/local/bin/check-disk", checkDiskScript),
             ("usr/local/bin/luks-info", luksInfoScript),
-            ("usr/local/bin/probe-disks", probeDisksScript)
+            ("usr/local/bin/probe-disks", probeDisksScript),
+            ("usr/local/bin/fs-bridge", fsBridgeScript)
         ]
     }
 
@@ -38,8 +39,11 @@ ROWS=30
 READONLY_MODE=0
 AUTO_MOUNT=0
 QUIET_SHUTDOWN=0
+BRIDGE_MODE=0
+BROWSE_ONLY=0
 HOST_PATH_DISPLAY=""
 EXEC_CMD_B64=""
+PASS_B64=""
 
 for param in $(cat /proc/cmdline); do
     case "$param" in
@@ -48,6 +52,9 @@ for param in $(cat /proc/cmdline); do
         vm.ro=1) READONLY_MODE=1 ;;
         vm.automount=1) AUTO_MOUNT=1 ;;
         vm.quiet=1) QUIET_SHUTDOWN=1 ;;
+        vm.bridge=1) BRIDGE_MODE=1 ;;
+        vm.browse_only=1) BROWSE_ONLY=1 ;;
+        vm.pass64=*) PASS_B64="${param#vm.pass64=}" ;;
         vm.hostpath=*) HOST_PATH_DISPLAY="${param#vm.hostpath=}" ;;
         vm.exec64=*) EXEC_CMD_B64="${param#vm.exec64=}" ;;
         TERM=*) export TERM="${param#TERM=}" ;;
@@ -56,6 +63,9 @@ done
 
 export VM_READONLY="$READONLY_MODE"
 export VM_HOST_PATH="$HOST_PATH_DISPLAY"
+if [ -n "$PASS_B64" ]; then
+    export TUXDISK_PASS="$(printf "%s" "$PASS_B64" | base64 -d 2>/dev/null)"
+fi
 
 if [ -c /dev/hvc0 ]; then
     stty -F /dev/hvc0 cols "$COLS" rows "$ROWS" 2>/dev/null
@@ -88,7 +98,7 @@ fi
 mount -t virtiofs host /mnt/host 2>/dev/null || true
 
 # Auto-mount non-encrypted external partitions if requested
-if [ "$AUTO_MOUNT" = "1" ]; then
+if [ "$AUTO_MOUNT" = "1" ] && [ "$BRIDGE_MODE" = "0" ]; then
     /usr/local/bin/mount-disk --auto >/dev/null 2>&1 || true
 fi
 
@@ -111,6 +121,25 @@ cleanup_and_poweroff() {
     sync
     poweroff -f
 }
+
+# Configure and start macOS Finder filesystem bridge on /dev/hvc1 if requested
+if [ "$BRIDGE_MODE" = "1" ]; then
+    if [ -c /dev/hvc0 ]; then
+        setsid /usr/local/bin/mount-disk --all </dev/hvc0 >/dev/hvc0 2>&1 || true
+    else
+        /usr/local/bin/mount-disk --all || true
+    fi
+    if [ -c /dev/hvc1 ]; then
+        stty -F /dev/hvc1 raw -echo -echoe -echok -echonl -icanon -isig -iexten -ixon -ixoff -icrnl -ocrnl -onlcr 2>/dev/null || true
+        if [ "$BROWSE_ONLY" = "1" ]; then
+            /usr/local/bin/fs-bridge </dev/hvc1 >/dev/hvc1 2>/tmp/fs-bridge.log || true
+            cleanup_and_poweroff
+            exit 0
+        else
+            /usr/local/bin/fs-bridge </dev/hvc1 >/dev/hvc1 2>/tmp/fs-bridge.log &
+        fi
+    fi
+fi
 
 # One-shot command mode (-e / --command / inspect / check / copy / format)
 if [ -n "$EXEC_CMD_B64" ]; then
@@ -137,6 +166,9 @@ echo -e "\033[1;36m╰───────────────────�
 
 if mountpoint -q /mnt/host 2>/dev/null; then
     echo -e "  \033[1;32m● macOS Host Share:\033[0m \033[1m/mnt/host\033[0m  ──▶  ${VM_HOST_PATH:-macOS directory}"
+fi
+if [ "$BRIDGE_MODE" = "1" ]; then
+    echo -e "  \033[1;36m● macOS Finder:\033[0m     \033[1;36mACTIVE\033[0m (mounted via WebDAV bridge)"
 fi
 if [ "$READONLY_MODE" = "1" ]; then
     echo -e "  \033[1;33m● Access Mode:\033[0m      \033[1;33mREAD-ONLY\033[0m (external drives are write-protected)"
@@ -557,5 +589,305 @@ else
     done
 fi
 /usr/local/bin/unmount-all --quiet >/dev/null 2>&1 || true
+"""#
+
+    /// `/usr/local/bin/fs-bridge` — Framing RPC & stream filesystem bridge over `/dev/hvc1`
+    public static let fsBridgeScript = #"""
+#!/bin/sh
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LC_ALL=C
+
+stty raw -echo -opost -onlcr -icrnl -inlcr -igncr 2>/dev/null || true
+
+TAB=$(printf '\t')
+
+send_ok_file() {
+    B64=$(base64 < "$1" 2>/dev/null | tr -d '\r\n')
+    printf "OK\t%s\n" "$B64"
+}
+
+send_ok_str() {
+    B64=$(printf "%s" "$1" | base64 2>/dev/null | tr -d '\r\n')
+    printf "OK\t%s\n" "$B64"
+}
+
+get_mount_list() {
+    awk '$2 ~ /^\/mnt\/disks\/[^\/]+$/ {print $2}' /proc/mounts
+}
+
+get_effective_root() {
+    MOUNTS=$(get_mount_list)
+    COUNT=$(printf "%s\n" "$MOUNTS" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [ "$COUNT" -eq 1 ]; then
+        printf "%s" "$MOUNTS"
+    else
+        printf "/mnt/disks"
+    fi
+}
+
+resolve_path() {
+    ROOT=$(get_effective_root)
+    REL=$(printf "%s" "$1" | base64 -d 2>/dev/null || true)
+    while [ "${REL#/}" != "$REL" ]; do REL="${REL#/}"; done
+    while [ "${REL%/}" != "$REL" ]; do REL="${REL%/}"; done
+    case "/$REL/" in
+        */../*) return 1 ;;
+    esac
+    if [ -z "$REL" ]; then
+        printf "%s" "$ROOT"
+    else
+        printf "%s/%s" "$ROOT" "$REL"
+    fi
+}
+
+while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
+    CMD=$(printf "%s" "$CMD" | tr -d '\r')
+    ARG4=$(printf "%s" "$ARG4" | tr -d '\r')
+    ARG3=$(printf "%s" "$ARG3" | tr -d '\r')
+    ARG2=$(printf "%s" "$ARG2" | tr -d '\r')
+    ARG1=$(printf "%s" "$ARG1" | tr -d '\r')
+
+    [ -z "$CMD" ] && continue
+
+    case "$CMD" in
+        PING)
+            MOUNTS=$(get_mount_list)
+            COUNT=$(printf "%s\n" "$MOUNTS" | sed '/^$/d' | wc -l | tr -d ' ')
+            if [ "$COUNT" -eq 0 ]; then
+                printf "ERR\tENOMOUNT\n"
+            else
+                ROOT=$(get_effective_root)
+                if [ "$ROOT" = "/mnt/disks" ]; then
+                    LABEL="TuxDisk"
+                else
+                    LABEL=$(basename "$ROOT")
+                fi
+                send_ok_str "$LABEL"
+            fi
+            ;;
+
+        STAT)
+            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            if [ ! -e "$TARGET" ] && [ ! -L "$TARGET" ]; then
+                printf "ERR\tENOENT\n"
+                continue
+            fi
+            if [ -d "$TARGET" ]; then
+                TYPE="dir"
+                SIZE=0
+            else
+                TYPE="file"
+                SIZE=$(stat -L -c "%s" "$TARGET" 2>/dev/null || stat -c "%s" "$TARGET" 2>/dev/null || echo 0)
+            fi
+            MTIME=$(stat -L -c "%Y" "$TARGET" 2>/dev/null || stat -c "%Y" "$TARGET" 2>/dev/null || echo 0)
+            send_ok_str "$(printf "%s\t%s\t%s" "$TYPE" "$SIZE" "$MTIME")"
+            ;;
+
+        LIST)
+            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            if [ ! -d "$TARGET" ]; then
+                printf "ERR\tENOENT\n"
+                continue
+            fi
+            MTIME=$(stat -L -c "%Y" "$TARGET" 2>/dev/null || stat -c "%Y" "$TARGET" 2>/dev/null || echo 0)
+            printf "dir\t0\t%s\t.\n" "$MTIME" > /tmp/bridge_list.$$
+            for item in "$TARGET"/* "$TARGET"/.[!.]* "$TARGET"/..?*; do
+                [ ! -e "$item" ] && [ ! -L "$item" ] && continue
+                NAME=$(basename "$item")
+                if [ -d "$item" ]; then
+                    ITYPE="dir"
+                    ISIZE=0
+                else
+                    ITYPE="file"
+                    ISIZE=$(stat -L -c "%s" "$item" 2>/dev/null || stat -c "%s" "$item" 2>/dev/null || echo 0)
+                fi
+                IMTIME=$(stat -L -c "%Y" "$item" 2>/dev/null || stat -c "%Y" "$item" 2>/dev/null || echo 0)
+                printf "%s\t%s\t%s\t%s\n" "$ITYPE" "$ISIZE" "$IMTIME" "$NAME" >> /tmp/bridge_list.$$
+            done
+            send_ok_file /tmp/bridge_list.$$
+            rm -f /tmp/bridge_list.$$
+            ;;
+
+        STATFS)
+            MOUNTS=$(get_mount_list)
+            if [ -n "$MOUNTS" ]; then
+                STATFS_STR=$(df -B1 $MOUNTS 2>/dev/null | awk 'NR>1 {tot+=$2; used+=$3; avail+=$4} END {printf "%d\t%d\t%d", tot+0, used+0, avail+0}')
+            else
+                STATFS_STR="0	0	0"
+            fi
+            send_ok_str "$STATFS_STR"
+            ;;
+
+        READ)
+            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            OFFSET="${ARG2:-0}"
+            LENGTH="${ARG3:-0}"
+            if [ ! -f "$TARGET" ]; then
+                printf "ERR\tENOENT\n"
+                continue
+            fi
+            FSIZE=$(stat -L -c "%s" "$TARGET" 2>/dev/null || stat -c "%s" "$TARGET" 2>/dev/null || echo 0)
+            if [ "$OFFSET" -ge "$FSIZE" ] || [ "$LENGTH" -le 0 ]; then
+                ACTUAL=0
+            else
+                REM=$((FSIZE - OFFSET))
+                if [ "$LENGTH" -lt "$REM" ]; then
+                    ACTUAL="$LENGTH"
+                else
+                    ACTUAL="$REM"
+                fi
+            fi
+            if [ "$ACTUAL" -gt 0 ]; then
+                B64=$(tail -c +$((OFFSET + 1)) "$TARGET" 2>/dev/null | head -c "$ACTUAL" | base64 2>/dev/null | tr -d '\r\n')
+                printf "OK\t%s\n" "$B64"
+            else
+                printf "OK\t\n"
+            fi
+            ;;
+
+        WRITE)
+            TARGET=$(resolve_path "$ARG1") || {
+                printf "ERR\tEINVAL\n"
+                continue
+            }
+            OFFSET="${ARG2:-0}"
+            TRUNC="${ARG3:-1}"
+            DATA_B64="${ARG4:-}"
+            if [ "${VM_READONLY:-0}" = "1" ]; then
+                printf "ERR\tEROFS\n"
+                continue
+            fi
+            ROOT=$(get_effective_root)
+            if [ "$ROOT" = "/mnt/disks" ] && [ "$(dirname "$TARGET")" = "/mnt/disks" ]; then
+                printf "ERR\tEACCES\n"
+                continue
+            fi
+            if [ -n "$DATA_B64" ]; then
+                printf "%s" "$DATA_B64" | base64 -d > /tmp/bridge_write.$$ 2>/dev/null || : > /tmp/bridge_write.$$
+            else
+                : > /tmp/bridge_write.$$
+            fi
+            LENGTH=$(wc -c < /tmp/bridge_write.$$ | tr -d ' ')
+            mkdir -p "$(dirname "$TARGET")" 2>/dev/null || true
+            WRITE_OK=1
+            if [ "$TRUNC" = "1" ] && [ "$OFFSET" = "0" ]; then
+                cat /tmp/bridge_write.$$ > "$TARGET" 2>/dev/null || WRITE_OK=0
+            else
+                [ ! -f "$TARGET" ] && (: > "$TARGET" 2>/dev/null || WRITE_OK=0)
+                if [ "$LENGTH" -gt 0 ] && [ "$WRITE_OK" = "1" ]; then
+                    CUR_SIZE=$(stat -L -c "%s" "$TARGET" 2>/dev/null || echo 0)
+                    if [ "$OFFSET" = "$CUR_SIZE" ]; then
+                        cat /tmp/bridge_write.$$ >> "$TARGET" 2>/dev/null || WRITE_OK=0
+                    else
+                        dd if=/tmp/bridge_write.$$ of="$TARGET" bs=65536 seek="$OFFSET" oflag=seek_bytes conv=notrunc status=none 2>/dev/null \
+                            || dd if=/tmp/bridge_write.$$ of="$TARGET" bs=1 seek="$OFFSET" conv=notrunc status=none 2>/dev/null \
+                            || WRITE_OK=0
+                    fi
+                fi
+            fi
+            rm -f /tmp/bridge_write.$$
+            if [ "$WRITE_OK" = "1" ]; then
+                printf "OK\t\n"
+            else
+                printf "ERR\tEIO\n"
+            fi
+            ;;
+
+        MKDIR)
+            if [ "${VM_READONLY:-0}" = "1" ]; then
+                printf "ERR\tEROFS\n"
+                continue
+            fi
+            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            ROOT=$(get_effective_root)
+            if [ "$ROOT" = "/mnt/disks" ] && [ "$(dirname "$TARGET")" = "/mnt/disks" ]; then
+                printf "ERR\tEACCES\n"
+                continue
+            fi
+            if mkdir -p "$TARGET" 2>/dev/null; then
+                printf "OK\t\n"
+            else
+                printf "ERR\tEIO\n"
+            fi
+            ;;
+
+        DELETE)
+            if [ "${VM_READONLY:-0}" = "1" ]; then
+                printf "ERR\tEROFS\n"
+                continue
+            fi
+            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            ROOT=$(get_effective_root)
+            if [ "$TARGET" = "$ROOT" ] || [ "$TARGET" = "/mnt/disks" ]; then
+                printf "ERR\tEACCES\n"
+                continue
+            fi
+            if [ ! -e "$TARGET" ] && [ ! -L "$TARGET" ]; then
+                printf "ERR\tENOENT\n"
+                continue
+            fi
+            if rm -rf "$TARGET" 2>/dev/null; then
+                printf "OK\t\n"
+            else
+                printf "ERR\tEIO\n"
+            fi
+            ;;
+
+        MOVE)
+            if [ "${VM_READONLY:-0}" = "1" ]; then
+                printf "ERR\tEROFS\n"
+                continue
+            fi
+            SRC=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            DST=$(resolve_path "$ARG2") || { printf "ERR\tEINVAL\n"; continue; }
+            if [ ! -e "$SRC" ] && [ ! -L "$SRC" ]; then
+                printf "ERR\tENOENT\n"
+                continue
+            fi
+            mkdir -p "$(dirname "$DST")" 2>/dev/null || true
+            rm -rf "$DST" 2>/dev/null || true
+            if mv -f "$SRC" "$DST" 2>/dev/null; then
+                printf "OK\t\n"
+            else
+                printf "ERR\tEIO\n"
+            fi
+            ;;
+
+        COPY)
+            if [ "${VM_READONLY:-0}" = "1" ]; then
+                printf "ERR\tEROFS\n"
+                continue
+            fi
+            SRC=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            DST=$(resolve_path "$ARG2") || { printf "ERR\tEINVAL\n"; continue; }
+            if [ ! -e "$SRC" ] && [ ! -L "$SRC" ]; then
+                printf "ERR\tENOENT\n"
+                continue
+            fi
+            mkdir -p "$(dirname "$DST")" 2>/dev/null || true
+            rm -rf "$DST" 2>/dev/null || true
+            if cp -af "$SRC" "$DST" 2>/dev/null; then
+                printf "OK\t\n"
+            else
+                printf "ERR\tEIO\n"
+            fi
+            ;;
+
+        SYNC)
+            sync
+            printf "OK\t\n"
+            ;;
+
+        SHUTDOWN)
+            sync
+            printf "OK\t\n"
+            exit 0
+            ;;
+
+        *)
+            printf "ERR\tENOSYS\n"
+            ;;
+    esac
+done
 """#
 }

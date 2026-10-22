@@ -1,6 +1,22 @@
 import Foundation
 import Virtualization
 
+public struct SerialBridgePipes: Sendable {
+    public let hostReadHandle: FileHandle
+    public let hostWriteHandle: FileHandle
+    public let guestReadHandle: FileHandle
+    public let guestWriteHandle: FileHandle
+
+    public init() {
+        let hostToGuest = Pipe()
+        let guestToHost = Pipe()
+        self.hostWriteHandle = hostToGuest.fileHandleForWriting
+        self.guestReadHandle = hostToGuest.fileHandleForReading
+        self.guestWriteHandle = guestToHost.fileHandleForWriting
+        self.hostReadHandle = guestToHost.fileHandleForReading
+    }
+}
+
 public struct VMConfigurationOptions: Sendable {
     public var kernelURL: URL
     public var initrdURL: URL
@@ -15,6 +31,8 @@ public struct VMConfigurationOptions: Sendable {
     public var kernelCommandLine: String
     public var rawTerminal: Bool = true
     public var quietAttachmentLogs: Bool = false
+    public var bridgePipes: SerialBridgePipes? = nil
+    public var onVMStarted: (@Sendable () -> Void)? = nil
 
     public init(
         kernelURL: URL,
@@ -29,7 +47,9 @@ public struct VMConfigurationOptions: Sendable {
         memorySizeMB: UInt64 = 2048,
         kernelCommandLine: String,
         rawTerminal: Bool = true,
-        quietAttachmentLogs: Bool = false
+        quietAttachmentLogs: Bool = false,
+        bridgePipes: SerialBridgePipes? = nil,
+        onVMStarted: (@Sendable () -> Void)? = nil
     ) {
         self.kernelURL = kernelURL
         self.initrdURL = initrdURL
@@ -44,6 +64,8 @@ public struct VMConfigurationOptions: Sendable {
         self.kernelCommandLine = kernelCommandLine
         self.rawTerminal = rawTerminal
         self.quietAttachmentLogs = quietAttachmentLogs
+        self.bridgePipes = bridgePipes
+        self.onVMStarted = onVMStarted
     }
 }
 
@@ -91,7 +113,18 @@ public enum VMRunner {
             fileHandleForReading: FileHandle.standardInput,
             fileHandleForWriting: FileHandle.standardOutput
         )
-        config.serialPorts = [consoleConfig]
+        var serialPorts: [VZVirtioConsoleDeviceSerialPortConfiguration] = [consoleConfig]
+
+        // Optional secondary serial port (hvc1) for Finder filesystem bridge
+        if let bridge = options.bridgePipes {
+            let bridgePort = VZVirtioConsoleDeviceSerialPortConfiguration()
+            bridgePort.attachment = VZFileHandleSerialPortAttachment(
+                fileHandleForReading: bridge.guestReadHandle,
+                fileHandleForWriting: bridge.guestWriteHandle
+            )
+            serialPorts.append(bridgePort)
+        }
+        config.serialPorts = serialPorts
 
         // Entropy device (fast random numbers for cryptsetup / LUKS)
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
@@ -146,7 +179,7 @@ public enum VMRunner {
         try config.validate()
 
         do {
-            try await startVM(with: config, rawTerminal: options.rawTerminal)
+            try await startVM(with: config, rawTerminal: options.rawTerminal, onVMStarted: options.onVMStarted)
         } catch {
             if !config.directorySharingDevices.isEmpty &&
                error.localizedDescription.localizedCaseInsensitiveContains("Fuse sandbox extension") {
@@ -155,7 +188,7 @@ public enum VMRunner {
                 }
                 config.directorySharingDevices = []
                 try config.validate()
-                try await startVM(with: config, rawTerminal: options.rawTerminal)
+                try await startVM(with: config, rawTerminal: options.rawTerminal, onVMStarted: options.onVMStarted)
             } else {
                 throw error
             }
@@ -163,7 +196,11 @@ public enum VMRunner {
     }
 
     @MainActor
-    private static func startVM(with config: VZVirtualMachineConfiguration, rawTerminal: Bool) async throws {
+    private static func startVM(
+        with config: VZVirtualMachineConfiguration,
+        rawTerminal: Bool,
+        onVMStarted: (@Sendable () -> Void)?
+    ) async throws {
         let vm = VZVirtualMachine(configuration: config)
 
         if rawTerminal {
@@ -188,7 +225,7 @@ public enum VMRunner {
             vm.start { result in
                 switch result {
                 case .success:
-                    break
+                    onVMStarted?()
                 case .failure(let error):
                     TerminalManager.shared.restore()
                     continuation.resume(throwing: error)
