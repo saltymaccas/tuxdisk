@@ -4,6 +4,7 @@ public struct CLIOptions: Sendable {
     public enum Subcommand: Sendable {
         case list
         case browse
+        case webdavStatus
         case inspect
         case check
         case copy(source: String, destination: String)
@@ -17,7 +18,7 @@ public struct CLIOptions: Sendable {
         case help
     }
 
-    public var subcommand: Subcommand = .shell
+    public var subcommand: Subcommand = .browse
     public var disks: [String] = []
     public var readOnly: Bool = false
     public var allowInternal: Bool = false
@@ -77,6 +78,8 @@ struct TuxDisk {
                     cpuCount: options.cpuCount,
                     memoryMB: options.memoryMB
                 )
+            case .webdavStatus:
+                try Operations.printWebDAVStatus(port: options.webdavPort, asJSON: options.jsonOutput)
             case .inspect:
                 try await Operations.inspectDisks(options.disks, allowInternal: options.allowInternal)
             case .check:
@@ -147,6 +150,7 @@ struct TuxDisk {
                     bridgePipes = pipes
                     finderController = FinderSessionController(
                         pipes: pipes,
+                        disks: options.disks,
                         readOnly: options.readOnly,
                         mountPoint: options.mountPoint,
                         preferredPort: options.webdavPort,
@@ -207,15 +211,16 @@ struct TuxDisk {
             let knownSubcommands: Set<String> = [
                 "list", "ls", "disks",
                 "browse", "mount", "finder",
+                "webdav", "webdav-status", "webdav-info", "mounts", "status",
                 "inspect", "info", "probe",
                 "check", "fsck", "repair",
                 "copy", "cp", "pull", "push",
                 "create-image", "mkimg",
                 "format", "mkfs",
                 "eject", "unmount",
-                "doctor", "status",
+                "doctor",
                 "setup",
-                "shell", "run",
+                "shell", "sh", "bash", "run",
                 "version",
                 "help"
             ]
@@ -236,6 +241,8 @@ struct TuxDisk {
                 return opts
             case "-l", "--list":
                 explicitSubcommand = "list"
+            case "--shell":
+                explicitSubcommand = "shell"
             case "--external":
                 opts.externalOnly = true
             case "--json":
@@ -341,6 +348,8 @@ struct TuxDisk {
         case "browse", "mount", "finder":
             opts.disks.append(contentsOf: positional)
             opts.subcommand = .browse
+        case "webdav", "webdav-status", "webdav-info", "mounts", "status":
+            opts.subcommand = .webdavStatus
         case "inspect", "info", "probe":
             opts.disks.append(contentsOf: positional)
             opts.subcommand = .inspect
@@ -371,17 +380,20 @@ struct TuxDisk {
                 throw cliError("Usage: tuxdisk eject <disk> (e.g., tuxdisk eject /dev/disk4)")
             }
             opts.subcommand = .eject(disk: targetDisk)
-        case "doctor", "status":
+        case "doctor":
             opts.subcommand = .doctor
         case "setup":
             opts.subcommand = .setup(force: opts.yesConfirm)
+        case "shell", "sh", "bash", "run":
+            opts.disks.append(contentsOf: positional)
+            opts.subcommand = .shell
         case "version":
             opts.subcommand = .version
         case "help":
             opts.subcommand = .help
         default:
             opts.disks.append(contentsOf: positional)
-            opts.subcommand = .shell
+            opts.subcommand = (opts.execCommand != nil) ? .shell : .browse
         }
 
         return opts
@@ -403,9 +415,10 @@ struct TuxDisk {
           • FAT32 / exFAT / NTFS              • macOS Finder WebDAV & VirtioFS
 
         \(ConsoleStyle.boldWhite)COMMANDS:\(ConsoleStyle.reset)
+          \(ConsoleStyle.cyan)tuxdisk [browse]\(ConsoleStyle.reset) <disk...> [options]      Mount Linux drive(s) as a volume in macOS Finder (default)
           \(ConsoleStyle.cyan)tuxdisk list\(ConsoleStyle.reset) [--external] [--json]        List macOS block devices & highlight Linux partitions
-          \(ConsoleStyle.cyan)tuxdisk browse\(ConsoleStyle.reset) <disk...> [options]        Mount Linux drive(s) as a volume in macOS Finder
-          \(ConsoleStyle.cyan)tuxdisk [shell]\(ConsoleStyle.reset) [disks...] [options]      Boot interactive Linux shell with external drive(s)
+          \(ConsoleStyle.cyan)tuxdisk webdav\(ConsoleStyle.reset) [--port <p>] [--json]      Check status, health & metrics of WebDAV Finder mounts
+          \(ConsoleStyle.cyan)tuxdisk shell\(ConsoleStyle.reset) [disks...] [options]        Boot interactive Linux shell with external drive(s)
           \(ConsoleStyle.cyan)tuxdisk inspect\(ConsoleStyle.reset) <disk...>                 Probe partition tables, UUIDs, LVM/LUKS & disk usage
           \(ConsoleStyle.cyan)tuxdisk copy\(ConsoleStyle.reset) <src> <dst>                  Copy files between a Linux drive (<disk>:<path>) and macOS
           \(ConsoleStyle.cyan)tuxdisk check\(ConsoleStyle.reset) <disk> [--repair]           Run fsck / btrfs check / xfs_repair on drive partitions
@@ -417,6 +430,7 @@ struct TuxDisk {
 
         \(ConsoleStyle.boldWhite)FINDER / SHELL / GENERAL OPTIONS:\(ConsoleStyle.reset)
           -d, --disk <path>       Attach a raw block device (e.g. /dev/disk4) or image file (.img)
+          --shell                 Boot interactive Linux shell instead of default Finder browse mode
           -b, --browse, --finder  Mount attached Linux drive(s) in macOS Finder alongside shell
           --mount-point <dir>     Custom macOS directory for Finder WebDAV mount (default: ~/Volumes/<label>)
           --port <port>           Localhost port for embedded WebDAV bridge (default: auto)
@@ -441,19 +455,23 @@ struct TuxDisk {
           \(ConsoleStyle.dim)# 1. Discover connected external drives on macOS:\(ConsoleStyle.reset)
           tuxdisk list
 
-          \(ConsoleStyle.dim)# 2. Mount and browse an external Linux drive directly in macOS Finder:\(ConsoleStyle.reset)
-          sudo tuxdisk browse /dev/disk4
+          \(ConsoleStyle.dim)# 2. Mount and browse an external Linux drive directly in macOS Finder (default):\(ConsoleStyle.reset)
+          sudo tuxdisk /dev/disk4
 
-          \(ConsoleStyle.dim)# 3. Inspect partitions, LUKS headers, LVM volumes, and files on /dev/disk4:\(ConsoleStyle.reset)
+          \(ConsoleStyle.dim)# 3. Check live WebDAV bridge status, Finder mounts, and transfer metrics:\(ConsoleStyle.reset)
+          tuxdisk webdav
+
+          \(ConsoleStyle.dim)# 4. Inspect partitions, LUKS headers, LVM volumes, and files on /dev/disk4:\(ConsoleStyle.reset)
           sudo tuxdisk inspect /dev/disk4
 
-          \(ConsoleStyle.dim)# 4. Enter interactive Linux shell AND browse in macOS Finder simultaneously:\(ConsoleStyle.reset)
-          sudo tuxdisk /dev/disk4 --browse
+          \(ConsoleStyle.dim)# 5. Enter interactive Linux shell (with optional Finder mount alongside):\(ConsoleStyle.reset)
+          sudo tuxdisk shell /dev/disk4
+          sudo tuxdisk shell /dev/disk4 --browse
 
-          \(ConsoleStyle.dim)# 5. Copy a folder directly from an external Linux drive to macOS:\(ConsoleStyle.reset)
+          \(ConsoleStyle.dim)# 6. Copy a folder directly from an external Linux drive to macOS:\(ConsoleStyle.reset)
           sudo tuxdisk copy /dev/disk4:/home/alice/Photos ~/Downloads/Photos
 
-          \(ConsoleStyle.dim)# 6. Create an encrypted 1GB Btrfs + LUKS2 + LVM2 disk image:\(ConsoleStyle.reset)
+          \(ConsoleStyle.dim)# 7. Create an encrypted 1GB Btrfs + LUKS2 + LVM2 disk image:\(ConsoleStyle.reset)
           tuxdisk create-image vault.img --size 1G --fs btrfs --label Vault --luks --lvm
         """)
     }

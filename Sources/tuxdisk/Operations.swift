@@ -313,7 +313,7 @@ public enum Operations {
                 exit 1
             fi
             echo "==> Copying from Linux volume ($MATCH) to macOS (\#(macDestURL.path))..."
-            rsync -aHAX --info=progress2 "$MATCH" "/mnt/host/\#(targetNameInShare)"
+            rsync -a --whole-file --inplace --info=progress2 "$MATCH" "/mnt/host/\#(targetNameInShare)"
             sync
             """#
 
@@ -359,7 +359,7 @@ public enum Operations {
             fi
             mkdir -p "$(dirname "$DEST_PATH")"
             echo "==> Copying from macOS (\#(macSrcURL.path)) to Linux volume ($DEST_PATH)..."
-            rsync -aHAX --info=progress2 "/mnt/host/\#(srcName)" "$DEST_PATH"
+            rsync -a --whole-file --inplace --info=progress2 "/mnt/host/\#(srcName)" "$DEST_PATH"
             sync
             """#
 
@@ -404,6 +404,16 @@ public enum Operations {
         let isSupported = VZVirtualMachine.isSupported
         print("  \(isSupported ? "\(ConsoleStyle.boldGreen)✓\(ConsoleStyle.reset)" : "\(ConsoleStyle.boldRed)✗\(ConsoleStyle.reset)") Apple Virtualization.framework Supported: \(isSupported)")
 
+        let hasMountWebDAV = FileManager.default.isExecutableFile(atPath: "/sbin/mount_webdav")
+        print("  \(hasMountWebDAV ? "\(ConsoleStyle.boldGreen)✓\(ConsoleStyle.reset)" : "\(ConsoleStyle.boldYellow)⚠\(ConsoleStyle.reset)") macOS Finder WebDAV Mounter:              /sbin/mount_webdav (\(hasMountWebDAV ? "Available" : "Missing"))")
+
+        let activeWebDAV = WebDAVStatusInspector.collectStatuses()
+        if activeWebDAV.isEmpty {
+            print("  \(ConsoleStyle.boldGreen)✓\(ConsoleStyle.reset) Active WebDAV Sessions:                   0 active (run 'tuxdisk browse <disk>' to mount)")
+        } else {
+            print("  \(ConsoleStyle.boldGreen)✓\(ConsoleStyle.reset) Active WebDAV Sessions:                   \(activeWebDAV.count) mounted (run 'tuxdisk webdav' for details)")
+        }
+
         let assetsDir = ImageBuilder.defaultAssetsDirectory()
         let paths = VMAssetPaths(baseDir: assetsDir)
         print("  \(paths.isReady ? "\(ConsoleStyle.boldGreen)✓\(ConsoleStyle.reset)" : "\(ConsoleStyle.boldYellow)⚠\(ConsoleStyle.reset)") VM Assets Directory: \(assetsDir.path) (\(paths.isReady ? "Ready" : "Needs 'tuxdisk setup'"))")
@@ -424,6 +434,7 @@ public enum Operations {
             echo "  ✓ cryptsetup (LUKS):   $(cryptsetup --version)"
             echo "  ✓ LVM2:                $(lvm version | head -n 1 | sed 's/^ *//')"
             echo "  ✓ rsync:               $(rsync --version | head -n 1)"
+            echo "  ✓ Finder FS Bridge:    /usr/local/bin/fs-bridge ($(test -x /usr/local/bin/fs-bridge && echo Ready || echo Missing))"
             """
             try await runOneShotCommand(
                 disks: [],
@@ -437,7 +448,168 @@ public enum Operations {
         }
     }
 
-    /// `tuxdisk browse <disk...> [--read-only] [--mount-point <dir>] [--port <port>] [--no-open]`
+    /// `tuxdisk webdav [--port <port>] [--json]` — Checks status and info of the WebDAV subsystem and active mounts
+    public static func printWebDAVStatus(port: UInt16 = 0, asJSON: Bool = false) throws {
+        let snapshots = WebDAVStatusInspector.collectStatuses(specificPort: port)
+        let hasMountWebDAV = FileManager.default.isExecutableFile(atPath: "/sbin/mount_webdav")
+        let defaultMountRoot = FinderMounter.defaultMountDirectory(for: "<VolumeLabel>").path
+
+        if asJSON {
+            struct SubsystemInfo: Codable {
+                let serverVersion: String
+                let davCompliance: String
+                let transportBridge: String
+                let hostMounterPath: String
+                let hostMounterAvailable: Bool
+                let defaultMountPattern: String
+                let suppressedMetadataPatterns: [String]
+                let supportedMethods: [String]
+            }
+            struct WebDAVReport: Codable {
+                let subsystem: SubsystemInfo
+                let activeSessionCount: Int
+                let sessions: [WebDAVStatusSnapshot]
+            }
+
+            let report = WebDAVReport(
+                subsystem: SubsystemInfo(
+                    serverVersion: "tuxdisk-webdav/1.0",
+                    davCompliance: "Class 1, 2 (RFC 4918 / RFC 4331 Quota)",
+                    transportBridge: "Virtio Console Serial Port (/dev/hvc1 <-> /usr/local/bin/fs-bridge)",
+                    hostMounterPath: "/sbin/mount_webdav",
+                    hostMounterAvailable: hasMountWebDAV,
+                    defaultMountPattern: defaultMountRoot,
+                    suppressedMetadataPatterns: [
+                        ".DS_Store", "._*", ".Spotlight-V100", ".Trashes",
+                        ".fseventsd", ".TemporaryItems", ".DocumentRevisions-V100"
+                    ],
+                    supportedMethods: [
+                        "OPTIONS", "PROPFIND", "PROPPATCH", "GET", "HEAD",
+                        "PUT", "MKCOL", "DELETE", "MOVE", "COPY", "LOCK", "UNLOCK"
+                    ]
+                ),
+                activeSessionCount: snapshots.count,
+                sessions: snapshots
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(report)
+            if let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+            return
+        }
+
+        print("\(ConsoleStyle.boldCyan)╭────────────────────────────────────────────────────────────────────────────╮\(ConsoleStyle.reset)")
+        print("\(ConsoleStyle.boldCyan)│\(ConsoleStyle.reset)  \(ConsoleStyle.boldWhite)tuxdisk webdav\(ConsoleStyle.reset) — macOS Finder WebDAV Bridge Status & Info                 \(ConsoleStyle.boldCyan)│\(ConsoleStyle.reset)")
+        print("\(ConsoleStyle.boldCyan)╰────────────────────────────────────────────────────────────────────────────╯\(ConsoleStyle.reset)")
+        print("")
+        print("\(ConsoleStyle.boldWhite)WebDAV Subsystem Info:\(ConsoleStyle.reset)")
+        print("  • \(ConsoleStyle.boldWhite)Server Engine:\(ConsoleStyle.reset)       tuxdisk-webdav/1.0 (HTTP/1.1, WebDAV Class 1 & 2, RFC 4331)")
+        print("  • \(ConsoleStyle.boldWhite)VM Transport:\(ConsoleStyle.reset)        Virtio Serial Port (/dev/hvc1 ──▶ /usr/local/bin/fs-bridge)")
+        print("  • \(ConsoleStyle.boldWhite)macOS Mounter:\(ConsoleStyle.reset)       /sbin/mount_webdav (\(hasMountWebDAV ? "\(ConsoleStyle.boldGreen)Available\(ConsoleStyle.reset)" : "\(ConsoleStyle.boldRed)Missing\(ConsoleStyle.reset)"))")
+        print("  • \(ConsoleStyle.boldWhite)Default Mount Path:\(ConsoleStyle.reset)  \(defaultMountRoot)")
+        print("  • \(ConsoleStyle.boldWhite)Metadata Filter:\(ConsoleStyle.reset)     Suppresses .DS_Store, ._*, .Spotlight-V100, .Trashes, .fseventsd")
+        print("")
+
+        if snapshots.isEmpty {
+            if port > 0 {
+                ConsoleStyle.warn("No active tuxdisk WebDAV server found on port \(port).")
+            } else {
+                print("\(ConsoleStyle.boldWhite)Active WebDAV Sessions:\(ConsoleStyle.reset) \(ConsoleStyle.dim)(0 mounted)\(ConsoleStyle.reset)")
+                print("  \(ConsoleStyle.yellow)○ No Linux volumes are currently mounted via WebDAV.\(ConsoleStyle.reset)")
+                print("")
+                print("  \(ConsoleStyle.dim)To mount a Linux drive or disk image in macOS Finder:\(ConsoleStyle.reset)")
+                print("    \(ConsoleStyle.cyan)sudo tuxdisk /dev/disk4\(ConsoleStyle.reset)")
+                print("    \(ConsoleStyle.cyan)tuxdisk my-linux-disk.img\(ConsoleStyle.reset)")
+            }
+            return
+        }
+
+        print("\(ConsoleStyle.boldWhite)Active WebDAV Sessions (\(snapshots.count)):\(ConsoleStyle.reset)")
+        for (idx, snap) in snapshots.enumerated() {
+            if idx > 0 { print("") }
+            print("──────────────────────────────────────────────────────────────────────────────")
+            let statusBadge: String
+            switch snap.status.lowercased() {
+            case "online", "mounted":
+                statusBadge = "\(ConsoleStyle.boldGreen)● ONLINE\(ConsoleStyle.reset)"
+            case "degraded":
+                statusBadge = "\(ConsoleStyle.boldYellow)● DEGRADED\(ConsoleStyle.reset)"
+            default:
+                statusBadge = "\(ConsoleStyle.boldRed)● OFFLINE\(ConsoleStyle.reset)"
+            }
+            let pidStr = snap.pid > 0 ? " (PID \(snap.pid), Uptime: \(formatUptime(snap.metrics.uptimeSeconds)))" : ""
+            print("  \(ConsoleStyle.boldWhite)[\(idx + 1)] Volume: \(snap.volumeLabel)\(ConsoleStyle.reset)  \(statusBadge)\(ConsoleStyle.dim)\(pidStr)\(ConsoleStyle.reset)")
+
+            if !snap.disks.isEmpty {
+                print("      \(ConsoleStyle.boldWhite)Attached Disk(s):\(ConsoleStyle.reset)   \(snap.disks.joined(separator: ", "))")
+            }
+
+            if let mp = snap.mountPoint, !mp.isEmpty {
+                let mountBadge = snap.finderMounted
+                    ? "\(ConsoleStyle.boldGreen)Mounted in Finder\(ConsoleStyle.reset)"
+                    : "\(ConsoleStyle.boldYellow)Not mounted on host\(ConsoleStyle.reset)"
+                print("      \(ConsoleStyle.boldWhite)Finder Mount:\(ConsoleStyle.reset)       \(mp) (\(mountBadge))")
+            }
+
+            print("      \(ConsoleStyle.boldWhite)WebDAV URL:\(ConsoleStyle.reset)         \(ConsoleStyle.cyan)\(snap.webdavURL)\(ConsoleStyle.reset)")
+            print("      \(ConsoleStyle.boldWhite)Status Endpoint:\(ConsoleStyle.reset)    \(ConsoleStyle.dim)\(snap.statusEndpointURL)\(ConsoleStyle.reset)")
+
+            let modeBadge = snap.readOnly
+                ? "\(ConsoleStyle.boldYellow)READ-ONLY\(ConsoleStyle.reset)"
+                : "\(ConsoleStyle.boldGreen)READ-WRITE\(ConsoleStyle.reset)"
+            let metaBadge = snap.suppressMacMetadata ? "macOS clutter suppression active" : "metadata passthrough"
+            print("      \(ConsoleStyle.boldWhite)Access Mode:\(ConsoleStyle.reset)        \(modeBadge) (\(metaBadge))")
+
+            let latencyText = snap.bridgeLatencyMs.map { String(format: "%.2f ms", $0) } ?? "n/a"
+            let bridgeBadge = snap.bridgeHealthy
+                ? "\(ConsoleStyle.boldGreen)Healthy\(ConsoleStyle.reset) (PING: \(latencyText))"
+                : "\(ConsoleStyle.boldRed)Unreachable\(ConsoleStyle.reset)"
+            print("      \(ConsoleStyle.boldWhite)Guest FS Bridge:\(ConsoleStyle.reset)    \(bridgeBadge)")
+
+            if let fs = snap.filesystemStats, fs.totalBytes > 0 {
+                let fsType = (fs.filesystemType ?? "linux").uppercased()
+                let devSuffix = fs.sourceDevice.map { " on \($0)" } ?? ""
+                let pct = String(format: "%.1f%%", fs.usagePercent)
+                let usedStr = ConsoleStyle.formatBytes(fs.usedBytes)
+                let totalStr = ConsoleStyle.formatBytes(fs.totalBytes)
+                let availStr = ConsoleStyle.formatBytes(fs.availableBytes)
+                print("      \(ConsoleStyle.boldWhite)Linux Filesystem:\(ConsoleStyle.reset)   \(ConsoleStyle.boldCyan)\(fsType)\(ConsoleStyle.reset)\(devSuffix) — \(usedStr) used / \(totalStr) total (\(availStr) free, \(pct))")
+            }
+
+            let m = snap.metrics
+            let readStr = ConsoleStyle.formatBytes(Int64(clamping: m.bytesRead))
+            let writtenStr = ConsoleStyle.formatBytes(Int64(clamping: m.bytesWritten))
+            print("      \(ConsoleStyle.boldWhite)WebDAV Traffic:\(ConsoleStyle.reset)     \(m.totalRequests) requests (\(m.activeConnections) active) · Read: \(readStr) · Written: \(writtenStr)")
+            print("      \(ConsoleStyle.boldWhite)Metadata Filter:\(ConsoleStyle.reset)    \(m.suppressedMetadataWrites) macOS metadata writes intercepted (\(m.cachedMetadataEntries) cached in RAM)")
+
+            if !m.methodCounts.isEmpty {
+                let breakdown = m.methodCounts
+                    .sorted { $0.key < $1.key }
+                    .map { "\($0.key): \($0.value)" }
+                    .joined(separator: ", ")
+                print("      \(ConsoleStyle.boldWhite)Method Breakdown:\(ConsoleStyle.reset)   \(ConsoleStyle.dim)\(breakdown)\(ConsoleStyle.reset)")
+            }
+        }
+        print("──────────────────────────────────────────────────────────────────────────────")
+    }
+
+    private static func formatUptime(_ seconds: Int64) -> String {
+        let s = max(0, seconds)
+        let hrs = s / 3600
+        let mins = (s % 3600) / 60
+        let secs = s % 60
+        if hrs > 0 {
+            return "\(hrs)h \(mins)m \(secs)s"
+        } else if mins > 0 {
+            return "\(mins)m \(secs)s"
+        } else {
+            return "\(secs)s"
+        }
+    }
+
+    /// `tuxdisk [browse] <disk...> [--read-only] [--mount-point <dir>] [--port <port>] [--no-open]`
     @MainActor
     public static func browseDisks(
         _ disks: [String],
@@ -452,7 +624,7 @@ public enum Operations {
     ) async throws {
         guard !disks.isEmpty else {
             throw NSError(domain: "tuxdisk", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Please specify at least one disk or image to browse in Finder (e.g. 'sudo tuxdisk browse /dev/disk4')."
+                NSLocalizedDescriptionKey: "Please specify at least one disk or image to browse in Finder (e.g. 'sudo tuxdisk /dev/disk4' or 'tuxdisk list' to see drives, or 'tuxdisk shell' for an interactive Linux shell)."
             ])
         }
 
@@ -479,6 +651,7 @@ public enum Operations {
         let bridgePipes = SerialBridgePipes()
         let controller = FinderSessionController(
             pipes: bridgePipes,
+            disks: disks,
             readOnly: readOnly,
             mountPoint: mountPoint,
             preferredPort: preferredPort,
@@ -519,6 +692,7 @@ public enum Operations {
 /// Manages the lifecycle of the host WebDAV server, Finder volume mount, and signal/eject watchers
 public final class FinderSessionController: @unchecked Sendable {
     public let client: SerialGuestFSClient
+    public let disks: [String]
     public let readOnly: Bool
     public let mountPoint: String?
     public let preferredPort: UInt16
@@ -528,6 +702,7 @@ public final class FinderSessionController: @unchecked Sendable {
     private let lock = NSLock()
     private var server: FinderWebDAVServer? = nil
     private var mounter: FinderMounter? = nil
+    private var registeredPort: UInt16 = 0
     private var sigIntSource: DispatchSourceSignal? = nil
     private var sigTermSource: DispatchSourceSignal? = nil
     private var ejectTimer: DispatchSourceTimer? = nil
@@ -536,6 +711,7 @@ public final class FinderSessionController: @unchecked Sendable {
 
     public init(
         pipes: SerialBridgePipes,
+        disks: [String] = [],
         readOnly: Bool,
         mountPoint: String?,
         preferredPort: UInt16,
@@ -543,6 +719,7 @@ public final class FinderSessionController: @unchecked Sendable {
         isBrowseOnly: Bool
     ) {
         self.client = SerialGuestFSClient(readHandle: pipes.hostReadHandle, writeHandle: pipes.hostWriteHandle)
+        self.disks = disks
         self.readOnly = readOnly
         self.mountPoint = mountPoint
         self.preferredPort = preferredPort
@@ -562,7 +739,9 @@ public final class FinderSessionController: @unchecked Sendable {
                 let webdav = FinderWebDAVServer(
                     backend: self.client,
                     readOnly: self.readOnly,
-                    suppressMacMetadata: true
+                    suppressMacMetadata: true,
+                    volumeLabel: volumeLabel,
+                    disks: self.disks
                 )
                 try webdav.start(preferredPort: self.preferredPort)
 
@@ -571,11 +750,29 @@ public final class FinderSessionController: @unchecked Sendable {
                     webdavURLString: webdav.baseURLString,
                     customMountPoint: self.mountPoint
                 )
+                webdav.updateSessionMetadata(
+                    volumeLabel: finderMounter.volumeLabel,
+                    mountPointPath: finderMounter.mountPointURL.path,
+                    disks: self.disks
+                )
                 try finderMounter.mountAndOpenInFinder(openWindow: self.openFinder)
+
+                let sessionRecord = WebDAVSessionRecord(
+                    port: webdav.port,
+                    webdavURL: webdav.baseURLString,
+                    statusEndpointURL: webdav.statusEndpointURLString,
+                    volumeLabel: finderMounter.volumeLabel,
+                    mountPoint: finderMounter.mountPointURL.path,
+                    readOnly: self.readOnly,
+                    suppressMacMetadata: true,
+                    disks: self.disks
+                )
+                WebDAVSessionRegistry.register(sessionRecord)
 
                 self.lock.lock()
                 self.server = webdav
                 self.mounter = finderMounter
+                self.registeredPort = webdav.port
                 self.lock.unlock()
 
                 if self.isBrowseOnly {
@@ -588,6 +785,7 @@ public final class FinderSessionController: @unchecked Sendable {
                         print("  \(ConsoleStyle.boldGreen)● Finder Mount:\(ConsoleStyle.reset)  \(ConsoleStyle.boldWhite)\(finderMounter.mountPointURL.path)\(ConsoleStyle.reset)")
                     }
                     print("  \(ConsoleStyle.boldGreen)● WebDAV URL:\(ConsoleStyle.reset)    \(webdav.baseURLString)")
+                    print("  \(ConsoleStyle.boldGreen)● WebDAV Info:\(ConsoleStyle.reset)   \(webdav.statusEndpointURLString) (or run 'tuxdisk webdav')")
                     let modeText = self.readOnly
                         ? "\(ConsoleStyle.boldYellow)READ-ONLY\(ConsoleStyle.reset)"
                         : "\(ConsoleStyle.boldGreen)READ-WRITE\(ConsoleStyle.reset) (.DS_Store / ._ clutter suppressed)"
@@ -656,11 +854,13 @@ public final class FinderSessionController: @unchecked Sendable {
         cleanedUp = true
         let currentMounter = mounter
         let currentServer = server
+        let portToUnregister = registeredPort
         let sigInt = sigIntSource
         let sigTerm = sigTermSource
         let timer = ejectTimer
         mounter = nil
         server = nil
+        registeredPort = 0
         sigIntSource = nil
         sigTermSource = nil
         ejectTimer = nil
@@ -670,6 +870,9 @@ public final class FinderSessionController: @unchecked Sendable {
         sigInt?.cancel()
         sigTerm?.cancel()
 
+        if portToUnregister > 0 {
+            WebDAVSessionRegistry.unregister(port: portToUnregister)
+        }
         currentMounter?.unmountAndCleanup()
         currentServer?.stop()
         try? client.shutdown()

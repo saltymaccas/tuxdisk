@@ -316,14 +316,15 @@ mount_single_fs() {
     fi
 
     mkdir -p "$TARGET"
+    blockdev --setra 8192 "$DEV" 2>/dev/null || true
     if [ "${VM_READONLY:-0}" = "1" ]; then
         if [ "$FSTYPE" = "ext4" ] || [ "$FSTYPE" = "ext3" ] || [ "$FSTYPE" = "ext2" ] || [ "$FSTYPE" = "xfs" ]; then
-            mount -t "$FSTYPE" -o ro,noload "$DEV" "$TARGET" 2>/dev/null || mount -t "$FSTYPE" -o ro "$DEV" "$TARGET"
+            mount -t "$FSTYPE" -o ro,noload,noatime "$DEV" "$TARGET" 2>/dev/null || mount -t "$FSTYPE" -o ro "$DEV" "$TARGET"
         else
-            mount -t "$FSTYPE" -o ro "$DEV" "$TARGET"
+            mount -t "$FSTYPE" -o ro,noatime "$DEV" "$TARGET" 2>/dev/null || mount -t "$FSTYPE" -o ro "$DEV" "$TARGET"
         fi
     else
-        mount -t "$FSTYPE" "$DEV" "$TARGET"
+        mount -t "$FSTYPE" -o noatime "$DEV" "$TARGET" 2>/dev/null || mount -t "$FSTYPE" "$DEV" "$TARGET"
     fi
     echo -e "\033[1;32m✓ Mounted $DEV ($FSTYPE) -> $TARGET\033[0m"
 
@@ -591,7 +592,7 @@ fi
 /usr/local/bin/unmount-all --quiet >/dev/null 2>&1 || true
 """#
 
-    /// `/usr/local/bin/fs-bridge` — Framing RPC & stream filesystem bridge over `/dev/hvc1`
+    /// `/usr/local/bin/fs-bridge` — High-speed binary & RPC filesystem bridge over `/dev/hvc1`
     public static let fsBridgeScript = #"""
 #!/bin/sh
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -600,14 +601,20 @@ export LC_ALL=C
 stty raw -echo -opost -onlcr -icrnl -inlcr -igncr 2>/dev/null || true
 
 TAB=$(printf '\t')
+CR=$(printf '\r')
+
+EFFECTIVE_ROOT=""
+LAST_ARG1=""
+LAST_TARGET=""
+LAST_FSIZE=""
 
 send_ok_file() {
-    B64=$(base64 < "$1" 2>/dev/null | tr -d '\r\n')
+    B64=$(base64 -w 0 < "$1" 2>/dev/null || base64 < "$1" 2>/dev/null | tr -d '\r\n')
     printf "OK\t%s\n" "$B64"
 }
 
 send_ok_str() {
-    B64=$(printf "%s" "$1" | base64 2>/dev/null | tr -d '\r\n')
+    B64=$(printf "%s" "$1" | base64 -w 0 2>/dev/null || printf "%s" "$1" | base64 2>/dev/null | tr -d '\r\n')
     printf "OK\t%s\n" "$B64"
 }
 
@@ -615,18 +622,27 @@ get_mount_list() {
     awk '$2 ~ /^\/mnt\/disks\/[^\/]+$/ {print $2}' /proc/mounts
 }
 
-get_effective_root() {
+refresh_effective_root() {
     MOUNTS=$(get_mount_list)
     COUNT=$(printf "%s\n" "$MOUNTS" | sed '/^$/d' | wc -l | tr -d ' ')
     if [ "$COUNT" -eq 1 ]; then
-        printf "%s" "$MOUNTS"
+        EFFECTIVE_ROOT="$MOUNTS"
+    elif [ "$COUNT" -gt 1 ]; then
+        EFFECTIVE_ROOT="/mnt/disks"
     else
-        printf "/mnt/disks"
+        EFFECTIVE_ROOT=""
     fi
 }
 
-resolve_path() {
-    ROOT=$(get_effective_root)
+resolve_target() {
+    if [ -z "$EFFECTIVE_ROOT" ]; then
+        refresh_effective_root
+        [ -z "$EFFECTIVE_ROOT" ] && EFFECTIVE_ROOT="/mnt/disks"
+    fi
+    if [ -n "$1" ] && [ "$1" = "$LAST_ARG1" ] && [ -n "$LAST_TARGET" ]; then
+        RESOLVED_TARGET="$LAST_TARGET"
+        return 0
+    fi
     REL=$(printf "%s" "$1" | base64 -d 2>/dev/null || true)
     while [ "${REL#/}" != "$REL" ]; do REL="${REL#/}"; done
     while [ "${REL%/}" != "$REL" ]; do REL="${REL%/}"; done
@@ -634,101 +650,114 @@ resolve_path() {
         */../*) return 1 ;;
     esac
     if [ -z "$REL" ]; then
-        printf "%s" "$ROOT"
+        RESOLVED_TARGET="$EFFECTIVE_ROOT"
     else
-        printf "%s/%s" "$ROOT" "$REL"
+        RESOLVED_TARGET="$EFFECTIVE_ROOT/$REL"
     fi
+    LAST_ARG1="$1"
+    LAST_TARGET="$RESOLVED_TARGET"
+    LAST_FSIZE=""
+    return 0
 }
 
 while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
-    CMD=$(printf "%s" "$CMD" | tr -d '\r')
-    ARG4=$(printf "%s" "$ARG4" | tr -d '\r')
-    ARG3=$(printf "%s" "$ARG3" | tr -d '\r')
-    ARG2=$(printf "%s" "$ARG2" | tr -d '\r')
-    ARG1=$(printf "%s" "$ARG1" | tr -d '\r')
+    CMD="${CMD%$CR}"
+    ARG1="${ARG1%$CR}"
+    ARG2="${ARG2%$CR}"
+    ARG3="${ARG3%$CR}"
+    ARG4="${ARG4%$CR}"
 
     [ -z "$CMD" ] && continue
 
     case "$CMD" in
         PING)
-            MOUNTS=$(get_mount_list)
-            COUNT=$(printf "%s\n" "$MOUNTS" | sed '/^$/d' | wc -l | tr -d ' ')
-            if [ "$COUNT" -eq 0 ]; then
+            refresh_effective_root
+            if [ -z "$EFFECTIVE_ROOT" ]; then
                 printf "ERR\tENOMOUNT\n"
             else
-                ROOT=$(get_effective_root)
-                if [ "$ROOT" = "/mnt/disks" ]; then
+                if [ "$EFFECTIVE_ROOT" = "/mnt/disks" ]; then
                     LABEL="TuxDisk"
                 else
-                    LABEL=$(basename "$ROOT")
+                    LABEL="${EFFECTIVE_ROOT##*/}"
                 fi
                 send_ok_str "$LABEL"
             fi
             ;;
 
         STAT)
-            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
-            if [ ! -e "$TARGET" ] && [ ! -L "$TARGET" ]; then
+            resolve_target "$ARG1" || { printf "ERR\tEINVAL\n"; continue; }
+            TARGET="$RESOLVED_TARGET"
+            STAT_OUT=$(stat -L -c "%F	%s	%Y" "$TARGET" 2>/dev/null || stat -c "%F	%s	%Y" "$TARGET" 2>/dev/null || true)
+            if [ -z "$STAT_OUT" ]; then
                 printf "ERR\tENOENT\n"
                 continue
             fi
-            if [ -d "$TARGET" ]; then
-                TYPE="dir"
-                SIZE=0
+            FTYPE="${STAT_OUT%%$TAB*}"
+            REST="${STAT_OUT#*$TAB}"
+            if [ "$FTYPE" = "directory" ]; then
+                MTIME="${REST#*$TAB}"
+                send_ok_str "dir	0	$MTIME"
             else
-                TYPE="file"
-                SIZE=$(stat -L -c "%s" "$TARGET" 2>/dev/null || stat -c "%s" "$TARGET" 2>/dev/null || echo 0)
+                LAST_FSIZE="${REST%%$TAB*}"
+                send_ok_str "file	$REST"
             fi
-            MTIME=$(stat -L -c "%Y" "$TARGET" 2>/dev/null || stat -c "%Y" "$TARGET" 2>/dev/null || echo 0)
-            send_ok_str "$(printf "%s\t%s\t%s" "$TYPE" "$SIZE" "$MTIME")"
             ;;
 
         LIST)
-            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            resolve_target "$ARG1" || { printf "ERR\tEINVAL\n"; continue; }
+            TARGET="$RESOLVED_TARGET"
             if [ ! -d "$TARGET" ]; then
                 printf "ERR\tENOENT\n"
                 continue
             fi
             MTIME=$(stat -L -c "%Y" "$TARGET" 2>/dev/null || stat -c "%Y" "$TARGET" 2>/dev/null || echo 0)
-            printf "dir\t0\t%s\t.\n" "$MTIME" > /tmp/bridge_list.$$
-            for item in "$TARGET"/* "$TARGET"/.[!.]* "$TARGET"/..?*; do
-                [ ! -e "$item" ] && [ ! -L "$item" ] && continue
-                NAME=$(basename "$item")
-                if [ -d "$item" ]; then
-                    ITYPE="dir"
-                    ISIZE=0
-                else
-                    ITYPE="file"
-                    ISIZE=$(stat -L -c "%s" "$item" 2>/dev/null || stat -c "%s" "$item" 2>/dev/null || echo 0)
-                fi
-                IMTIME=$(stat -L -c "%Y" "$item" 2>/dev/null || stat -c "%Y" "$item" 2>/dev/null || echo 0)
-                printf "%s\t%s\t%s\t%s\n" "$ITYPE" "$ISIZE" "$IMTIME" "$NAME" >> /tmp/bridge_list.$$
-            done
-            send_ok_file /tmp/bridge_list.$$
-            rm -f /tmp/bridge_list.$$
+            LIST_TMP="/dev/shm/bridge_list.$$"
+            printf "dir\t0\t%s\t.\n" "$MTIME" > "$LIST_TMP"
+            find "$TARGET" -mindepth 1 -maxdepth 1 -exec stat -L -c "%F	%s	%Y	%n" {} + 2>/dev/null | awk -F'\t' '
+            {
+                t = ($1 == "directory") ? "dir" : "file"
+                sz = (t == "dir") ? 0 : $2
+                n = $4
+                sub(/^.*\//, "", n)
+                if (n != "" && n != "." && n != "..") {
+                    printf "%s\t%s\t%s\t%s\n", t, sz, $3, n
+                }
+            }' >> "$LIST_TMP"
+            send_ok_file "$LIST_TMP"
+            rm -f "$LIST_TMP"
             ;;
 
         STATFS)
             MOUNTS=$(get_mount_list)
             if [ -n "$MOUNTS" ]; then
-                STATFS_STR=$(df -B1 $MOUNTS 2>/dev/null | awk 'NR>1 {tot+=$2; used+=$3; avail+=$4} END {printf "%d\t%d\t%d", tot+0, used+0, avail+0}')
+                STATFS_STR=$(df -B1 $MOUNTS 2>/dev/null | awk 'NR>1 {tot+=$2; used+=$3; avail+=$4} END {printf "%.0f\t%.0f\t%.0f", tot+0, used+0, avail+0}')
+                if [ -z "$STATFS_STR" ] || [ "$STATFS_STR" = "0	0	0" ]; then
+                    STATFS_STR=$(df -P -k $MOUNTS 2>/dev/null | awk 'NR>1 {tot+=$2*1024; used+=$3*1024; avail+=$4*1024} END {printf "%.0f\t%.0f\t%.0f", tot+0, used+0, avail+0}')
+                fi
+                FS_TYPES=$(awk '$2 ~ /^\/mnt\/disks\// {print $3}' /proc/mounts 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+                FS_DEVS=$(awk '$2 ~ /^\/mnt\/disks\// {print $1}' /proc/mounts 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+                STATFS_STR="${STATFS_STR:-0	0	0}	${FS_TYPES:-linux}	${FS_DEVS:-}"
             else
-                STATFS_STR="0	0	0"
+                STATFS_STR="0	0	0	none	"
             fi
             send_ok_str "$STATFS_STR"
             ;;
 
         READ)
-            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
+            resolve_target "$ARG1" || { printf "ERR\tEINVAL\n"; continue; }
+            TARGET="$RESOLVED_TARGET"
             OFFSET="${ARG2:-0}"
             LENGTH="${ARG3:-0}"
-            if [ ! -f "$TARGET" ]; then
-                printf "ERR\tENOENT\n"
-                continue
+            if [ -z "$LAST_FSIZE" ]; then
+                if [ ! -f "$TARGET" ]; then
+                    printf "ERR\tENOENT\n"
+                    continue
+                fi
+                LAST_FSIZE=$(stat -L -c "%s" "$TARGET" 2>/dev/null || stat -c "%s" "$TARGET" 2>/dev/null || echo 0)
             fi
-            FSIZE=$(stat -L -c "%s" "$TARGET" 2>/dev/null || stat -c "%s" "$TARGET" 2>/dev/null || echo 0)
+            FSIZE="$LAST_FSIZE"
             if [ "$OFFSET" -ge "$FSIZE" ] || [ "$LENGTH" -le 0 ]; then
-                ACTUAL=0
+                printf "OK_BIN\t0\n"
             else
                 REM=$((FSIZE - OFFSET))
                 if [ "$LENGTH" -lt "$REM" ]; then
@@ -736,20 +765,22 @@ while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
                 else
                     ACTUAL="$REM"
                 fi
-            fi
-            if [ "$ACTUAL" -gt 0 ]; then
-                B64=$(tail -c +$((OFFSET + 1)) "$TARGET" 2>/dev/null | head -c "$ACTUAL" | base64 2>/dev/null | tr -d '\r\n')
-                printf "OK\t%s\n" "$B64"
-            else
-                printf "OK\t\n"
+                printf "OK_BIN\t%s\n" "$ACTUAL"
+                if [ "$OFFSET" -eq 0 ] && [ "$ACTUAL" -eq "$FSIZE" ]; then
+                    cat "$TARGET" 2>/dev/null
+                else
+                    dd if="$TARGET" bs=1048576 skip="$OFFSET" count="$ACTUAL" iflag=skip_bytes,count_bytes status=none 2>/dev/null
+                fi
             fi
             ;;
 
         WRITE)
-            TARGET=$(resolve_path "$ARG1") || {
+            resolve_target "$ARG1" || {
                 printf "ERR\tEINVAL\n"
                 continue
             }
+            TARGET="$RESOLVED_TARGET"
+            LAST_FSIZE=""
             OFFSET="${ARG2:-0}"
             TRUNC="${ARG3:-1}"
             DATA_B64="${ARG4:-}"
@@ -757,35 +788,26 @@ while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
                 printf "ERR\tEROFS\n"
                 continue
             fi
-            ROOT=$(get_effective_root)
-            if [ "$ROOT" = "/mnt/disks" ] && [ "$(dirname "$TARGET")" = "/mnt/disks" ]; then
+            if [ "$EFFECTIVE_ROOT" = "/mnt/disks" ] && [ "${TARGET%/*}" = "/mnt/disks" ]; then
                 printf "ERR\tEACCES\n"
                 continue
             fi
-            if [ -n "$DATA_B64" ]; then
-                printf "%s" "$DATA_B64" | base64 -d > /tmp/bridge_write.$$ 2>/dev/null || : > /tmp/bridge_write.$$
-            else
-                : > /tmp/bridge_write.$$
-            fi
-            LENGTH=$(wc -c < /tmp/bridge_write.$$ | tr -d ' ')
-            mkdir -p "$(dirname "$TARGET")" 2>/dev/null || true
+            PARENT_DIR="${TARGET%/*}"
+            [ ! -d "$PARENT_DIR" ] && (mkdir -p "$PARENT_DIR" 2>/dev/null || true)
             WRITE_OK=1
             if [ "$TRUNC" = "1" ] && [ "$OFFSET" = "0" ]; then
-                cat /tmp/bridge_write.$$ > "$TARGET" 2>/dev/null || WRITE_OK=0
+                if [ -n "$DATA_B64" ]; then
+                    printf "%s" "$DATA_B64" | base64 -d > "$TARGET" 2>/dev/null || WRITE_OK=0
+                else
+                    : > "$TARGET" 2>/dev/null || WRITE_OK=0
+                fi
             else
                 [ ! -f "$TARGET" ] && (: > "$TARGET" 2>/dev/null || WRITE_OK=0)
-                if [ "$LENGTH" -gt 0 ] && [ "$WRITE_OK" = "1" ]; then
-                    CUR_SIZE=$(stat -L -c "%s" "$TARGET" 2>/dev/null || echo 0)
-                    if [ "$OFFSET" = "$CUR_SIZE" ]; then
-                        cat /tmp/bridge_write.$$ >> "$TARGET" 2>/dev/null || WRITE_OK=0
-                    else
-                        dd if=/tmp/bridge_write.$$ of="$TARGET" bs=65536 seek="$OFFSET" oflag=seek_bytes conv=notrunc status=none 2>/dev/null \
-                            || dd if=/tmp/bridge_write.$$ of="$TARGET" bs=1 seek="$OFFSET" conv=notrunc status=none 2>/dev/null \
-                            || WRITE_OK=0
-                    fi
+                if [ -n "$DATA_B64" ] && [ "$WRITE_OK" = "1" ]; then
+                    printf "%s" "$DATA_B64" | base64 -d | dd of="$TARGET" bs=1048576 seek="$OFFSET" oflag=seek_bytes conv=notrunc status=none 2>/dev/null \
+                        || WRITE_OK=0
                 fi
             fi
-            rm -f /tmp/bridge_write.$$
             if [ "$WRITE_OK" = "1" ]; then
                 printf "OK\t\n"
             else
@@ -798,9 +820,9 @@ while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
                 printf "ERR\tEROFS\n"
                 continue
             fi
-            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
-            ROOT=$(get_effective_root)
-            if [ "$ROOT" = "/mnt/disks" ] && [ "$(dirname "$TARGET")" = "/mnt/disks" ]; then
+            resolve_target "$ARG1" || { printf "ERR\tEINVAL\n"; continue; }
+            TARGET="$RESOLVED_TARGET"
+            if [ "$EFFECTIVE_ROOT" = "/mnt/disks" ] && [ "${TARGET%/*}" = "/mnt/disks" ]; then
                 printf "ERR\tEACCES\n"
                 continue
             fi
@@ -816,9 +838,10 @@ while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
                 printf "ERR\tEROFS\n"
                 continue
             fi
-            TARGET=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
-            ROOT=$(get_effective_root)
-            if [ "$TARGET" = "$ROOT" ] || [ "$TARGET" = "/mnt/disks" ]; then
+            resolve_target "$ARG1" || { printf "ERR\tEINVAL\n"; continue; }
+            TARGET="$RESOLVED_TARGET"
+            LAST_FSIZE=""
+            if [ "$TARGET" = "$EFFECTIVE_ROOT" ] || [ "$TARGET" = "/mnt/disks" ]; then
                 printf "ERR\tEACCES\n"
                 continue
             fi
@@ -838,13 +861,16 @@ while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
                 printf "ERR\tEROFS\n"
                 continue
             fi
-            SRC=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
-            DST=$(resolve_path "$ARG2") || { printf "ERR\tEINVAL\n"; continue; }
+            resolve_target "$ARG1" || { printf "ERR\tEINVAL\n"; continue; }
+            SRC="$RESOLVED_TARGET"
+            resolve_target "$ARG2" || { printf "ERR\tEINVAL\n"; continue; }
+            DST="$RESOLVED_TARGET"
+            LAST_FSIZE=""
             if [ ! -e "$SRC" ] && [ ! -L "$SRC" ]; then
                 printf "ERR\tENOENT\n"
                 continue
             fi
-            mkdir -p "$(dirname "$DST")" 2>/dev/null || true
+            mkdir -p "${DST%/*}" 2>/dev/null || true
             rm -rf "$DST" 2>/dev/null || true
             if mv -f "$SRC" "$DST" 2>/dev/null; then
                 printf "OK\t\n"
@@ -858,13 +884,16 @@ while IFS="$TAB" read -r CMD ARG1 ARG2 ARG3 ARG4; do
                 printf "ERR\tEROFS\n"
                 continue
             fi
-            SRC=$(resolve_path "$ARG1") || { printf "ERR\tEINVAL\n"; continue; }
-            DST=$(resolve_path "$ARG2") || { printf "ERR\tEINVAL\n"; continue; }
+            resolve_target "$ARG1" || { printf "ERR\tEINVAL\n"; continue; }
+            SRC="$RESOLVED_TARGET"
+            resolve_target "$ARG2" || { printf "ERR\tEINVAL\n"; continue; }
+            DST="$RESOLVED_TARGET"
+            LAST_FSIZE=""
             if [ ! -e "$SRC" ] && [ ! -L "$SRC" ]; then
                 printf "ERR\tENOENT\n"
                 continue
             fi
-            mkdir -p "$(dirname "$DST")" 2>/dev/null || true
+            mkdir -p "${DST%/*}" 2>/dev/null || true
             rm -rf "$DST" 2>/dev/null || true
             if cp -af "$SRC" "$DST" 2>/dev/null; then
                 printf "OK\t\n"

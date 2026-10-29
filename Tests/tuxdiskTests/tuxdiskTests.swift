@@ -56,6 +56,15 @@ func runInternalDiskProtectionTest() throws {
 }
 
 func runBrowseCLIArgumentParsingTest() throws {
+    let defaultBrowseOpts = try TuxDisk.parseArguments(["/dev/disk4", "--read-only"])
+    if case .browse = defaultBrowseOpts.subcommand {
+        // expected: browse is the default subcommand
+    } else {
+        throw NSError(domain: "tuxdiskTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected .browse as default subcommand"])
+    }
+    try assertTrue(defaultBrowseOpts.disks == ["/dev/disk4"], "Default browse positional disk parsed")
+    try assertTrue(defaultBrowseOpts.readOnly == true, "Default browse readOnly parsed")
+
     let browseOpts = try TuxDisk.parseArguments([
         "browse", "/dev/disk4", "--read-only", "--mount-point", "/tmp/my-mount", "--port", "18080", "--no-open"
     ])
@@ -78,7 +87,7 @@ func runBrowseCLIArgumentParsingTest() throws {
     }
     try assertTrue(mountAliasOpts.disks == ["test.img"], "mount alias positional disk")
 
-    let shellBrowseOpts = try TuxDisk.parseArguments(["/dev/disk4", "--browse"])
+    let shellBrowseOpts = try TuxDisk.parseArguments(["shell", "/dev/disk4", "--browse"])
     if case .shell = shellBrowseOpts.subcommand {
         // expected
     } else {
@@ -86,6 +95,38 @@ func runBrowseCLIArgumentParsingTest() throws {
     }
     try assertTrue(shellBrowseOpts.browseInFinder == true, "--browse flag in shell mode")
     try assertTrue(shellBrowseOpts.disks == ["/dev/disk4"], "disk in shell mode")
+
+    let shellFlagOpts = try TuxDisk.parseArguments(["/dev/disk4", "--shell"])
+    if case .shell = shellFlagOpts.subcommand {
+        // expected
+    } else {
+        throw NSError(domain: "tuxdiskTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected .shell for --shell flag"])
+    }
+
+    let execOpts = try TuxDisk.parseArguments(["-e", "uname -a"])
+    if case .shell = execOpts.subcommand {
+        // expected
+    } else {
+        throw NSError(domain: "tuxdiskTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected .shell when -e is provided"])
+    }
+
+    let webdavStatusOpts = try TuxDisk.parseArguments(["webdav", "--port", "19090", "--json"])
+    if case .webdavStatus = webdavStatusOpts.subcommand {
+        // expected
+    } else {
+        throw NSError(domain: "tuxdiskTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected .webdavStatus subcommand"])
+    }
+    try assertTrue(webdavStatusOpts.webdavPort == 19090, "webdav --port parsed")
+    try assertTrue(webdavStatusOpts.jsonOutput == true, "webdav --json parsed")
+
+    for alias in ["status", "mounts", "webdav-status", "webdav-info"] {
+        let aliasOpts = try TuxDisk.parseArguments([alias])
+        if case .webdavStatus = aliasOpts.subcommand {
+            // expected
+        } else {
+            throw NSError(domain: "tuxdiskTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected .webdavStatus for \(alias)"])
+        }
+    }
 }
 
 func runFinderMetadataFilterTest() throws {
@@ -334,6 +375,38 @@ func runWebDAVServerAndMetadataSuppressionTest() throws {
 
     let unlockResp = try sendWebDAVRequestOverSocketPair(server: server, method: "UNLOCK", path: "/notes.txt")
     try assertTrue(unlockResp.statusCode == 204, "UNLOCK status 204")
+
+    // 7. GET /.tuxdisk/status returns live WebDAVStatusSnapshot JSON
+    let statusResp = try sendWebDAVRequestOverSocketPair(server: server, method: "GET", path: "/.tuxdisk/status")
+    try assertTrue(statusResp.statusCode == 200, "GET /.tuxdisk/status returns 200")
+    let snap = try JSONDecoder().decode(WebDAVStatusSnapshot.self, from: statusResp.body)
+    try assertTrue(snap.status == "online", "Status snapshot is online")
+    try assertTrue(snap.volumeLabel == "TestLinuxVol", "Status snapshot volumeLabel matches ping()")
+    try assertTrue(snap.bridgeHealthy == true, "Status snapshot bridgeHealthy is true")
+    try assertTrue(snap.metrics.totalRequests == 7, "Status snapshot tracks 7 WebDAV requests")
+    try assertTrue(snap.metrics.suppressedMetadataWrites == 1, "Status snapshot tracks 1 suppressed .DS_Store write")
+    try assertTrue(snap.metrics.bytesWritten == UInt64("Created via Finder WebDAV".utf8.count), "Status snapshot tracks bytesWritten")
+    try assertTrue(snap.metrics.bytesRead == UInt64("Hello from Linux!".utf8.count), "Status snapshot tracks bytesRead")
+    try assertTrue(snap.filesystemStats?.totalBytes == 1024 * 1024 * 1024, "Status snapshot includes filesystemStats")
+
+    // 8. WebDAVSessionRegistry register, activeSessions, and unregister
+    let tempSessionsDir = FileManager.default.temporaryDirectory.appendingPathComponent("tuxdisk-sess-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tempSessionsDir) }
+    let record = WebDAVSessionRecord(
+        port: 18999,
+        webdavURL: "http://127.0.0.1:18999/",
+        statusEndpointURL: "http://127.0.0.1:18999/.tuxdisk/status",
+        volumeLabel: "TestLinuxVol",
+        mountPoint: "/tmp/TestLinuxVol",
+        readOnly: false,
+        suppressMacMetadata: true,
+        disks: ["/dev/disk4"]
+    )
+    WebDAVSessionRegistry.register(record, in: tempSessionsDir)
+    let active = WebDAVSessionRegistry.activeSessions(in: tempSessionsDir)
+    try assertTrue(active.count == 1 && active.first?.port == 18999, "WebDAVSessionRegistry lists active session")
+    WebDAVSessionRegistry.unregister(port: 18999, in: tempSessionsDir)
+    try assertTrue(WebDAVSessionRegistry.activeSessions(in: tempSessionsDir).isEmpty, "WebDAVSessionRegistry unregisters session")
 }
 
 @MainActor
@@ -354,7 +427,13 @@ func runLiveVMExt4WebDAVIntegrationTest() async throws {
 
     let bridgePipes = SerialBridgePipes()
     let client = SerialGuestFSClient(readHandle: bridgePipes.hostReadHandle, writeHandle: bridgePipes.hostWriteHandle)
-    let webdav = FinderWebDAVServer(backend: client, readOnly: false, suppressMacMetadata: true)
+    let webdav = FinderWebDAVServer(
+        backend: client,
+        readOnly: false,
+        suppressMacMetadata: true,
+        volumeLabel: "FinderE2E",
+        disks: [testImgURL.path]
+    )
 
     final class Box: @unchecked Sendable {
         var error: Error? = nil
@@ -449,6 +528,17 @@ func runLiveVMExt4WebDAVIntegrationTest() async throws {
                     try assertTrue(propXML.contains("/Documents/renamed.txt"), "PROPFIND contains renamed.txt")
                     try assertTrue(!propXML.contains(".DS_Store"), "PROPFIND omits .DS_Store")
 
+                    // Verify GET /.tuxdisk/status against live Linux VM
+                    let statusResp = try sendWebDAVRequestOverSocketPair(server: webdav, method: "GET", path: "/.tuxdisk/status")
+                    try assertTrue(statusResp.statusCode == 200, "Live VM GET /.tuxdisk/status 200")
+                    let liveSnap = try JSONDecoder().decode(WebDAVStatusSnapshot.self, from: statusResp.body)
+                    try assertTrue(liveSnap.status == "online", "Live VM WebDAV status is online")
+                    try assertTrue(liveSnap.volumeLabel == "FinderE2E", "Live VM WebDAV volumeLabel is FinderE2E")
+                    try assertTrue(liveSnap.bridgeHealthy == true, "Live VM WebDAV bridgeHealthy is true")
+                    try assertTrue((liveSnap.filesystemStats?.totalBytes ?? 0) > 10 * 1024 * 1024, "Live VM STATFS reports ext4 totalBytes")
+                    try assertTrue(liveSnap.filesystemStats?.filesystemType == "ext4", "Live VM STATFS reports ext4 filesystemType")
+                    try assertTrue(liveSnap.metrics.suppressedMetadataWrites == 2, "Live VM WebDAV suppressed 2 metadata writes")
+
                     // Verify directly on the Linux filesystem that .DS_Store was never written to ext4
                     var dsExistsOnLinux = false
                     if (try? client.stat(path: "/Documents/.DS_Store")) != nil {
@@ -488,7 +578,7 @@ struct TuxDiskTestRunner {
             try runWebDAVServerAndMetadataSuppressionTest()
             print("  ✓ testWebDAVServerAndMetadataSuppression passed")
             try await runLiveVMExt4WebDAVIntegrationTest()
-            print("  ✓ testLiveVMExt4WebDAVIntegration passed (ext4 VM mount + WebDAV CRUD + .DS_Store suppression)")
+            print("  ✓ testLiveVMExt4WebDAVIntegration passed (ext4 VM mount + WebDAV CRUD + status endpoint + .DS_Store suppression)")
             ConsoleStyle.success("All 7 test suites passed!")
         } catch {
             ConsoleStyle.error("Test failed: \(error.localizedDescription)")
